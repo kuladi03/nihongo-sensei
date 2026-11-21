@@ -7,11 +7,11 @@
 # Stage 1: Build Frontend Assets
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
-
 COPY frontend/package*.json ./
 RUN npm install
-
 COPY frontend/ ./
+ARG VITE_GOOGLE_CLIENT_ID
+ENV VITE_GOOGLE_CLIENT_ID=$VITE_GOOGLE_CLIENT_ID
 RUN npm run build
 
 # Stage 2: Production Python Backend & SPA Host
