@@ -1,0 +1,14 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+libsql-experimental>=0.0.55
+google-genai>=0.1.1
+edge-tts>=6.1.10
+pykakasi>=2.3.0
+PyJWT>=2.7.0
+bcrypt>=4.0.0
+google-auth>=2.0.0
+websockets>=13.0
+notion-client>=2.2.1
+requests>=2.31.0
+python-dotenv>=1.0.1
+pydantic>=2.6.0

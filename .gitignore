@@ -1,0 +1,30 @@
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+venv/
+.venv/
+
+# Database
+db/*.db
+db/*.db-*
+
+# Audio & Media Cache
+static/audio/*.mp3
+static/audio/*.wav
+audio_cache/*.mp3
+audio_cache/*.wav
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,733 @@
+import os
+import sqlite3
+import json
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from datetime import date, datetime
+
+DEFAULT_DB_PATH = Path(__file__).resolve().parent / "nihongo.db"
+SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+
+def get_db_path() -> Path:
+    env_path = os.getenv("DATABASE_PATH")
+    if env_path:
+        p = Path(env_path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent.parent / p
+        return p
+    return DEFAULT_DB_PATH
+
+# --- Turso / LibSQL Cloud Support ---
+class TursoRow:
+    """sqlite3.Row compatible wrapper for libsql query results."""
+    def __init__(self, cols: List[str], values: tuple):
+        self._d = dict(zip(cols, values))
+        self._v = list(values)
+        self._cols = cols
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._v[key]
+        return self._d[key]
+
+    def keys(self):
+        return self._d.keys()
+
+    def get(self, k, default=None):
+        return self._d.get(k, default)
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __repr__(self):
+        return repr(self._d)
+
+class TursoCursor:
+    """Cursor wrapper for libsql returning TursoRow instances."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql: str, params=()):
+        if params:
+            self._cur.execute(sql, params)
+        else:
+            self._cur.execute(sql)
+        return self
+
+    def executemany(self, sql: str, seq_of_params):
+        self._cur.executemany(sql, seq_of_params)
+        return self
+
+    def fetchone(self) -> Optional[TursoRow]:
+        r = self._cur.fetchone()
+        if r is None:
+            return None
+        cols = [c[0] for c in self._cur.description]
+        return TursoRow(cols, r)
+
+    def fetchall(self) -> List[TursoRow]:
+        rows = self._cur.fetchall()
+        if not rows:
+            return []
+        cols = [c[0] for c in self._cur.description]
+        return [TursoRow(cols, r) for r in rows]
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cur, "lastrowid", None)
+
+    def close(self):
+        self._cur.close()
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+class TursoConnection:
+    """Connection wrapper for libsql managing transactions and returning TursoCursor."""
+    def __init__(self, conn):
+        self._conn = conn
+        self.row_factory = None
+
+    def cursor(self) -> TursoCursor:
+        return TursoCursor(self._conn.cursor())
+
+    def execute(self, sql: str, params=()) -> TursoCursor:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executescript(self, script: str):
+        self._conn.executescript(script)
+        self._conn.commit()
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
+def is_turso_configured() -> bool:
+    return bool(os.getenv("TURSO_DATABASE_URL", "").strip())
+
+def get_connection(db_path: Optional[Path] = None):
+    turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
+    turso_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+    if turso_url and not db_path:
+        try:
+            import libsql_experimental as libsql
+            raw_conn = libsql.connect(turso_url, auth_token=turso_token or None)
+            return TursoConnection(raw_conn)
+        except Exception as e:
+            print(f"⚠️ [TURSO] Failed to connect to Turso at {turso_url}: {e}. Falling back to local SQLite.")
+
+    target = db_path or get_db_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(target)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def init_database(db_path: Optional[Path] = None):
+    """Initializes tables using schema.sql."""
+    conn = get_connection(db_path)
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        schema_sql = f.read()
+    with conn:
+        conn.executescript(schema_sql)
+    conn.close()
+
+# --- Notion Sync State ---
+def save_notion_sync(page_id: str, title: str, content_hash: str, raw_markdown: str, last_edited: Optional[str] = None):
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            INSERT INTO notion_sync_state (page_id, title, content_hash, raw_markdown, last_edited_time, synced_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(page_id) DO UPDATE SET
+                title = excluded.title,
+                content_hash = excluded.content_hash,
+                raw_markdown = excluded.raw_markdown,
+                last_edited_time = excluded.last_edited_time,
+                synced_at = CURRENT_TIMESTAMP;
+        """, (page_id, title, content_hash, raw_markdown, last_edited))
+    conn.close()
+
+def get_notion_sync(page_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM notion_sync_state WHERE page_id = ?", (page_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
+def get_all_synced_classes() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT page_id, title, content_hash, last_edited_time, synced_at, length(raw_markdown) as markdown_length FROM notion_sync_state ORDER BY title ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# --- Units ---
+def save_unit(
+    unit_number: int,
+    title: str,
+    lesson_json: str,
+    unit_type: str = "DAILY",
+    notion_page_id: Optional[str] = None,
+    content_hash: Optional[str] = None,
+    is_completed: bool = False
+) -> int:
+    conn = get_connection()
+    with conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO units (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, is_completed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(unit_number) DO UPDATE SET
+                unit_type = excluded.unit_type,
+                notion_page_id = excluded.notion_page_id,
+                content_hash = excluded.content_hash,
+                title = excluded.title,
+                lesson_json = excluded.lesson_json,
+                is_completed = MAX(units.is_completed, excluded.is_completed);
+        """, (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, int(is_completed)))
+        unit_id = cur.lastrowid
+        if not unit_id or unit_id == 0:
+            cur.execute("SELECT id FROM units WHERE unit_number = ?", (unit_number,))
+            unit_id = cur.fetchone()[0]
+    conn.close()
+    return unit_id
+
+def get_unit(unit_number: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM units WHERE unit_number = ?", (unit_number,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        d = dict(row)
+        try:
+            d["lesson_data"] = json.loads(d["lesson_json"])
+        except Exception:
+            d["lesson_data"] = {}
+        return d
+def get_unit_by_notion_page_id(page_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM units WHERE notion_page_id = ?", (page_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        d = dict(row)
+        try:
+            d["lesson_data"] = json.loads(d["lesson_json"])
+        except Exception:
+            d["lesson_data"] = {}
+        return d
+    return None
+
+def upsert_mastery_item(
+    unit_id: int,
+    item_type: str,
+    japanese: str,
+    kana_only: Optional[str] = None,
+    romaji: Optional[str] = None,
+    english: Optional[str] = None,
+    marathi: Optional[str] = None,
+    pronunciation_tip: Optional[str] = None,
+    audio_path: Optional[str] = None,
+    svg_markup: Optional[str] = None,
+    ease_factor: float = 2.5,
+    interval_days: int = 1,
+    repetitions: int = 0,
+    wrong_count: int = 0,
+    next_review_date: Optional[str] = None
+) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM mastery_items WHERE unit_id = ? AND japanese = ?", (unit_id, japanese))
+    row = cur.fetchone()
+    if row:
+        item_id = row["id"]
+        with conn:
+            conn.execute("""
+                UPDATE mastery_items SET
+                    item_type = ?,
+                    kana_only = COALESCE(?, kana_only),
+                    romaji = COALESCE(?, romaji),
+                    english = COALESCE(?, english),
+                    marathi = COALESCE(?, marathi),
+                    pronunciation_tip = COALESCE(?, pronunciation_tip),
+                    audio_path = COALESCE(?, audio_path),
+                    svg_markup = COALESCE(?, svg_markup)
+                WHERE id = ?
+            """, (item_type, kana_only, romaji, english, marathi, pronunciation_tip, audio_path, svg_markup, item_id))
+        conn.close()
+        return item_id
+    else:
+        conn.close()
+        return save_mastery_item(
+            unit_id=unit_id,
+            item_type=item_type,
+            japanese=japanese,
+            kana_only=kana_only,
+            romaji=romaji,
+            english=english,
+            marathi=marathi,
+            pronunciation_tip=pronunciation_tip,
+            audio_path=audio_path,
+            svg_markup=svg_markup,
+            ease_factor=ease_factor,
+            interval_days=interval_days,
+            repetitions=repetitions,
+            wrong_count=wrong_count,
+            next_review_date=next_review_date
+        )
+
+def get_all_units() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, unit_number, unit_type, notion_page_id, content_hash, title, is_completed, created_at FROM units ORDER BY unit_number ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def mark_unit_completed(unit_number: int, is_completed: bool = True):
+    conn = get_connection()
+    with conn:
+        conn.execute("UPDATE units SET is_completed = ? WHERE unit_number = ?", (int(is_completed), unit_number))
+    conn.close()
+
+# --- Mastery Items (SM-2 Bank) ---
+def save_mastery_item(
+    unit_id: int,
+    item_type: str,
+    japanese: str,
+    kana_only: Optional[str] = None,
+    romaji: Optional[str] = None,
+    english: Optional[str] = None,
+    marathi: Optional[str] = None,
+    pronunciation_tip: Optional[str] = None,
+    audio_path: Optional[str] = None,
+    svg_markup: Optional[str] = None,
+    ease_factor: float = 2.5,
+    interval_days: int = 1,
+    repetitions: int = 0,
+    wrong_count: int = 0,
+    next_review_date: Optional[str] = None
+) -> int:
+    conn = get_connection()
+    rev_date = next_review_date or date.today().isoformat()
+    with conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO mastery_items (
+                unit_id, item_type, japanese, kana_only, romaji, english, marathi,
+                pronunciation_tip, audio_path, svg_markup, ease_factor, interval_days,
+                repetitions, wrong_count, next_review_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            unit_id, item_type, japanese, kana_only, romaji, english, marathi,
+            pronunciation_tip, audio_path, svg_markup, ease_factor, interval_days,
+            repetitions, wrong_count, rev_date
+        ))
+        item_id = cur.lastrowid
+    conn.close()
+    return item_id
+
+def get_due_mastery_items(limit: int = 6) -> List[Dict[str, Any]]:
+    """Fetches up to `limit` items that are due for review or have previous mistakes."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM mastery_items
+        WHERE next_review_date <= date('now') OR wrong_count > 0
+        ORDER BY wrong_count DESC, next_review_date ASC
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def update_mastery_srs(
+    item_id: int,
+    ease_factor: float,
+    interval_days: int,
+    repetitions: int,
+    wrong_count: int,
+    next_review_date: str
+):
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            UPDATE mastery_items
+            SET ease_factor = ?, interval_days = ?, repetitions = ?, wrong_count = ?, next_review_date = ?
+            WHERE id = ?
+        """, (ease_factor, interval_days, repetitions, wrong_count, next_review_date, item_id))
+    conn.close()
+
+def get_mastery_items_for_unit(unit_id: int) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM mastery_items WHERE unit_id = ?", (unit_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# --- Kaggle Audio Cache ---
+def get_kaggle_audio(transcript: str) -> Optional[str]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT file_path FROM kaggle_audio WHERE transcript = ?", (transcript.strip(),))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+def save_kaggle_audio(transcript: str, file_path: str):
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            INSERT INTO kaggle_audio (transcript, file_path) VALUES (?, ?)
+            ON CONFLICT(transcript) DO UPDATE SET file_path = excluded.file_path
+        """, (transcript.strip(), file_path))
+    conn.close()
+
+# --- SVG Cache ---
+def get_cached_svg(keyword: str) -> Optional[str]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT svg_markup FROM svg_cache WHERE keyword = ?", (keyword.strip().lower(),))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+def save_cached_svg(keyword: str, svg_markup: str):
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            INSERT INTO svg_cache (keyword, svg_markup) VALUES (?, ?)
+            ON CONFLICT(keyword) DO UPDATE SET svg_markup = excluded.svg_markup
+        """, (keyword.strip().lower(), svg_markup))
+    conn.close()
+
+# --- User & Auth ---
+def get_users_count() -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    if not email:
+        return None
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email.strip(),))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def create_user(
+    email: str,
+    name: str,
+    password_hash: Optional[str] = None,
+    auth_provider: str = 'local',
+    role: str = 'student',
+    avatar_url: Optional[str] = None
+) -> Dict[str, Any]:
+    conn = get_connection()
+    with conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (email, name, password_hash, auth_provider, role, avatar_url, xp, streak)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+        """, (email.strip().lower(), name.strip(), password_hash, auth_provider, role, avatar_url))
+        user_id = cur.lastrowid
+    conn.close()
+    return get_user_by_id(user_id)
+
+def upsert_google_user(email: str, name: str, avatar_url: Optional[str] = None, default_role: str = 'student') -> Dict[str, Any]:
+    existing = get_user_by_email(email)
+    if existing:
+        conn = get_connection()
+        with conn:
+            conn.execute("""
+                UPDATE users SET name = COALESCE(?, name), avatar_url = COALESCE(?, avatar_url),
+                                 role = CASE WHEN ? = 'admin' THEN 'admin' ELSE role END
+                WHERE id = ?
+            """, (name, avatar_url, default_role, existing["id"]))
+        conn.close()
+        return get_user_by_id(existing["id"])
+    return create_user(
+        email=email,
+        name=name,
+        password_hash=None,
+        auth_provider='google',
+        role=default_role,
+        avatar_url=avatar_url
+    )
+
+def update_user_stats(user_id: int, xp_delta: int = 0, streak: Optional[int] = None):
+    conn = get_connection()
+    with conn:
+        if streak is not None:
+            conn.execute("UPDATE users SET xp = MAX(0, xp + ?), streak = MAX(?, 1) WHERE id = ?", (xp_delta, streak, user_id))
+        else:
+            conn.execute("UPDATE users SET xp = MAX(0, xp + ?), streak = MAX(COALESCE(streak, 0), 1) WHERE id = ?", (xp_delta, user_id))
+    conn.close()
+
+# --- Per-User Unit Progression ---
+def get_user_roadmap(user_id: int) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.id, u.unit_number, u.unit_type, u.title, u.created_at,
+               COALESCE(p.is_completed, 0) as is_completed,
+               COALESCE(p.best_accuracy, 0) as best_accuracy
+        FROM units u
+        LEFT JOIN user_unit_progress p ON u.unit_number = p.unit_number AND p.user_id = ?
+        ORDER BY u.unit_number ASC
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def mark_user_unit_completed(user_id: int, unit_number: int, is_completed: bool = True, accuracy: float = 1.0):
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            INSERT INTO user_unit_progress (user_id, unit_number, is_completed, best_accuracy, completed_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, unit_number) DO UPDATE SET
+                is_completed = MAX(user_unit_progress.is_completed, excluded.is_completed),
+                best_accuracy = MAX(user_unit_progress.best_accuracy, excluded.best_accuracy),
+                completed_at = CURRENT_TIMESTAMP
+        """, (user_id, unit_number, int(is_completed), float(accuracy)))
+    conn.close()
+
+# --- Per-User SM-2 Mastery ---
+def get_user_mastery_item(user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM user_mastery WHERE user_id = ? AND item_id = ?", (user_id, item_id))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def save_user_mastery(
+    user_id: int,
+    item_id: int,
+    ease_factor: float = 2.5,
+    interval_days: int = 1,
+    repetitions: int = 0,
+    wrong_count: int = 0,
+    next_review_date: Optional[str] = None
+):
+    rev_date = next_review_date or date.today().isoformat()
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            INSERT INTO user_mastery (
+                user_id, item_id, ease_factor, interval_days, repetitions, wrong_count, next_review_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET
+                ease_factor = excluded.ease_factor,
+                interval_days = excluded.interval_days,
+                repetitions = excluded.repetitions,
+                wrong_count = excluded.wrong_count,
+                next_review_date = excluded.next_review_date
+        """, (user_id, item_id, ease_factor, interval_days, repetitions, wrong_count, rev_date))
+    conn.close()
+
+def get_user_due_mastery_items(user_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.*, u.unit_number, u.title as unit_title,
+               COALESCE(um.ease_factor, 2.5) as ease_factor,
+               COALESCE(um.interval_days, 1) as interval_days,
+               COALESCE(um.repetitions, 0) as repetitions,
+               COALESCE(um.wrong_count, 0) as wrong_count,
+               COALESCE(um.next_review_date, date('now')) as next_review_date
+        FROM mastery_items m
+        JOIN units u ON m.unit_id = u.id
+        LEFT JOIN user_mastery um ON m.id = um.item_id AND um.user_id = ?
+        WHERE (um.next_review_date <= date('now') OR um.wrong_count > 0 OR um.user_id IS NULL)
+        ORDER BY COALESCE(um.wrong_count, 0) DESC, COALESCE(um.next_review_date, date('now')) ASC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_user_bank_items(user_id: int) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.*, u.unit_number, u.title as unit_title,
+               COALESCE(um.repetitions, 0) as repetitions,
+               COALESCE(um.wrong_count, 0) as wrong_count,
+               COALESCE(um.ease_factor, 2.5) as ease_factor,
+               COALESCE(um.interval_days, 1) as interval_days,
+               COALESCE(um.next_review_date, date('now')) as next_review_date
+        FROM mastery_items m
+        JOIN units u ON m.unit_id = u.id
+        LEFT JOIN user_mastery um ON m.id = um.item_id AND um.user_id = ?
+        ORDER BY u.unit_number ASC, m.id ASC
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# --- Live Sensei Practice Sessions & AI Recaps ---
+def save_live_session(
+    user_id: int,
+    unit_focus: str,
+    duration_seconds: int = 0,
+    summary_json: Optional[str] = None,
+    transcript_json: str = "[]",
+    whiteboard_json: str = "[]"
+) -> int:
+    conn = get_connection()
+    with conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO live_sessions (
+                user_id, unit_focus, duration_seconds, summary_json, transcript_json, whiteboard_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (user_id, unit_focus, duration_seconds, summary_json, transcript_json, whiteboard_json))
+        session_id = cur.lastrowid
+    conn.close()
+    return session_id
+
+def update_live_session_summary(session_id: int, summary_json: str) -> bool:
+    conn = get_connection()
+    with conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE live_sessions SET summary_json = ? WHERE id = ?", (summary_json, session_id))
+        updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+def get_user_live_sessions(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, user_id, unit_focus, duration_seconds, summary_json, transcript_json, whiteboard_json, created_at
+        FROM live_sessions
+        WHERE user_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        d = dict(r)
+        # Parse JSON fields for convenience
+        try:
+            d["summary"] = json.loads(d["summary_json"]) if d["summary_json"] else None
+        except Exception:
+            d["summary"] = None
+        try:
+            d["transcript"] = json.loads(d["transcript_json"]) if d["transcript_json"] else []
+        except Exception:
+            d["transcript"] = []
+        try:
+            d["whiteboard_cards"] = json.loads(d["whiteboard_json"]) if d["whiteboard_json"] else []
+        except Exception:
+            d["whiteboard_cards"] = []
+        results.append(d)
+    return results
+
+def get_user_recent_live_session_summaries(user_id: int, limit: int = 3) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, unit_focus, duration_seconds, summary_json, created_at
+        FROM live_sessions
+        WHERE user_id = ? AND summary_json IS NOT NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["summary"] = json.loads(d["summary_json"]) if d["summary_json"] else None
+        except Exception:
+            d["summary"] = None
+        if d["summary"]:
+            results.append(d)
+    return results
+
+# --- Autonomous Notion Auto-Sync State Tracking ---
+def get_notion_page_sync_state(page_id: str) -> Optional[Dict[str, Any]]:
+    """Returns the sync state and last_edited_time for a specific Notion page."""
+    clean_id = page_id.replace("-", "")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT page_id, last_edited_time, last_synced_at FROM notion_page_sync_state WHERE page_id = ?", (clean_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_all_notion_page_sync_states() -> Dict[str, str]:
+    """Returns a dictionary mapping page_id -> last_edited_time for all tracked Notion pages."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT page_id, last_edited_time FROM notion_page_sync_state")
+    rows = cur.fetchall()
+    conn.close()
+    return {r["page_id"]: r["last_edited_time"] for r in rows}
+
+def upsert_notion_page_sync_state(page_id: str, last_edited_time: str):
+    """Upserts the revision and sync timestamp for a Notion page."""
+    clean_id = page_id.replace("-", "")
+    conn = get_connection()
+    with conn:
+        conn.execute("""
+            INSERT INTO notion_page_sync_state (page_id, last_edited_time, last_synced_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(page_id) DO UPDATE SET
+                last_edited_time = excluded.last_edited_time,
+                last_synced_at = CURRENT_TIMESTAMP
+        """, (clean_id, last_edited_time))
+    conn.close()
+
+if __name__ == "__main__":
+    init_database()
+    print(f"✅ Database initialized with updated schema at: {get_db_path()}")
+
+
