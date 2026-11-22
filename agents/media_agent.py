@@ -32,7 +32,9 @@ class MediaEnricherAgent:
         """
         Resolves audio file path for a given Japanese phrase:
         1. Checks kaggle_audio table.
-        2. Fallback: Edge-TTS generation cached by MD5 in static/audio/.
+        2. Fallback: computes deterministic MD5 hash for on-demand lazy TTS.
+        Audio synthesis is handled on-demand by /static/audio/{filename} in server.py,
+        preventing event loop deadlocks and avoiding 75s+ eager synthesis during sync.
         Returns public URL path: /static/audio/<hash>.mp3
         """
         if not phrase or not phrase.strip():
@@ -45,34 +47,9 @@ class MediaEnricherAgent:
         if kaggle_file and Path(kaggle_file).exists():
             return f"/static/audio/{Path(kaggle_file).name}"
 
-        # 2. Edge-TTS fallback
+        # 2. Deterministic MD5 hash for on-demand lazy TTS
         phrase_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
-        filename = f"{phrase_hash}.mp3"
-        filepath = STATIC_AUDIO_DIR / filename
-        public_url = f"/static/audio/{filename}"
-
-        if filepath.exists() and filepath.stat().st_size > 0:
-            return public_url
-
-        try:
-            import edge_tts
-
-            async def _synthesize():
-                comm = edge_tts.Communicate(text, voice=self.voice, rate=self.rate)
-                await comm.save(str(filepath))
-
-            try:
-                asyncio.run(_synthesize())
-            except RuntimeError:
-                # In case an event loop is already running in current thread
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(_synthesize())
-                loop.close()
-
-            return public_url
-        except Exception as e:
-            print(f"⚠️ Audio generation error for '{text}': {e}")
-            return ""
+        return f"/static/audio/{phrase_hash}.mp3"
 
     def resolve_svg(self, keyword: str) -> str:
         """

@@ -109,6 +109,17 @@ class TursoConnection:
     def close(self):
         self._conn.close()
 
+    def sync(self):
+        """Triggers manual synchronization of the embedded replica with Turso cloud."""
+        if hasattr(self._conn, "sync"):
+            try:
+                return self._conn.sync()
+            except Exception:
+                return None
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
     def __enter__(self):
         return self
 
@@ -118,19 +129,40 @@ class TursoConnection:
         else:
             self.rollback()
 
+_replica_initialized = False
+
 def is_turso_configured() -> bool:
     return bool(os.getenv("TURSO_DATABASE_URL", "").strip())
 
 def get_connection(db_path: Optional[Path] = None):
+    global _replica_initialized
     turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
     turso_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
     if turso_url and not db_path:
         try:
             import libsql_experimental as libsql
-            raw_conn = libsql.connect(turso_url, auth_token=turso_token or None)
+            replica_path = Path(os.getenv("TURSO_REPLICA_PATH", "db/nihongo_replica.db"))
+            replica_path.parent.mkdir(parents=True, exist_ok=True)
+            sync_interval = int(os.getenv("TURSO_SYNC_INTERVAL", "60"))
+
+            raw_conn = libsql.connect(
+                str(replica_path),
+                sync_url=turso_url,
+                auth_token=turso_token or None,
+                sync_interval=sync_interval,
+            )
+
+            if not _replica_initialized:
+                try:
+                    raw_conn.sync()
+                    _replica_initialized = True
+                    print(f"✅ [TURSO] Initial embedded replica sync complete from {turso_url}.")
+                except Exception as sync_err:
+                    print(f"⚠️ [TURSO] Initial replica sync warning: {sync_err}")
+
             return TursoConnection(raw_conn)
         except Exception as e:
-            print(f"⚠️ [TURSO] Failed to connect to Turso at {turso_url}: {e}. Falling back to local SQLite.")
+            print(f"⚠️ [TURSO] Failed to connect to Turso replica at {turso_url}: {e}. Falling back to local SQLite.")
 
     target = db_path or get_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +170,18 @@ def get_connection(db_path: Optional[Path] = None):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
+def sync_turso_replica():
+    """Explicitly triggers a sync of the Turso embedded replica if configured."""
+    if is_turso_configured():
+        conn = get_connection()
+        try:
+            conn.sync()
+            print("🔄 [TURSO] Embedded replica synced successfully.")
+        except Exception as e:
+            print(f"⚠️ [TURSO] Embedded replica sync failed: {e}")
+        finally:
+            conn.close()
 
 def init_database(db_path: Optional[Path] = None):
     """Initializes tables using schema.sql."""

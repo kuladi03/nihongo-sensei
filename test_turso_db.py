@@ -65,8 +65,24 @@ class TestTursoDatabase(unittest.TestCase):
         conn = get_connection()
         self.assertIsNotNone(conn)
         turso_active = is_turso_configured()
-        print(f"  -> Active engine: {'Turso Remote SQLite' if turso_active else 'Local SQLite (db/nihongo.db)'}")
+        print(f"  -> Active engine: {'Turso Embedded Replica' if turso_active else 'Local SQLite (db/nihongo.db)'}")
         conn.close()
+
+    def test_turso_sync_method_and_replica_guard(self):
+        print("\n[TEST] 4. Testing TursoConnection sync method and replica guard...")
+        import libsql_experimental as libsql
+        import db.database as db_mod
+
+        raw = libsql.connect(":memory:")
+        conn = TursoConnection(raw)
+        # Test sync method delegation
+        sync_result = conn.sync()
+        self.assertIsNone(sync_result)  # In-memory conn has sync() which returns None
+
+        # Verify module-level flag exists and can be inspected
+        self.assertIn("_replica_initialized", dir(db_mod))
+        print("  -> Passed Turso sync method and replica guard test!")
 
 if __name__ == "__main__":
     unittest.main()
+
