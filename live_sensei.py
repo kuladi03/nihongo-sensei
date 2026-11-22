@@ -72,58 +72,58 @@ MODEL_DISPLAY_NAMES = {
 
 JLPT_N5_SCENARIOS = [
     {
-        "title": "Ordering at a Café (カフェでの注文)",
+        "title": "Ordering at a Café (カフェでの注文（ちゅうもん）)",
         "context": "The student is at a Japanese café ordering drinks and food.",
         "items": [
-            {"japanese": "すみません、アイスコーヒーを一つください。", "romaji": "Sumimasen, aisu koohii o hitotsu kudasai.", "english": "Excuse me, one iced coffee please.", "tip": "Use 〜を一つ (o hitotsu) for ordering one item."},
-            {"japanese": "テイクアウトでお願いします。", "romaji": "Teikuauto de onegaishimasu.", "english": "Takeout please / To go, please.", "tip": "Use 店内で (tennai de) if dining in."},
+            {"japanese": "すみません、アイスコーヒーを一つ (ひとつ) ください。", "romaji": "Sumimasen, aisu koohii o hitotsu kudasai.", "english": "Excuse me, one iced coffee please.", "tip": "Use 〜を一つ (o hitotsu) for ordering one item."},
+            {"japanese": "テイクアウトでお願 (ねが) いします。", "romaji": "Teikuauto de onegaishimasu.", "english": "Takeout please / To go, please.", "tip": "Use 店内で (tennai de) if dining in."},
             {"japanese": "いくらですか。", "romaji": "Ikura desu ka.", "english": "How much is it?", "tip": "Standard price question in Japanese."},
-            {"japanese": "カードで払えますか。", "romaji": "Kaado de haraemasu ka.", "english": "Can I pay with a card?", "tip": "〜で払えますか = Can I pay with ~?"},
+            {"japanese": "カードで払 (はら) えますか。", "romaji": "Kaado de haraemasu ka.", "english": "Can I pay with a card?", "tip": "〜で払えますか = Can I pay with ~?"},
             {"japanese": "ごちそうさまでした！", "romaji": "Gochisousama deshita!", "english": "Thank you for the meal / food!", "tip": "Polite phrase said when finishing eating or leaving a café."},
         ]
     },
     {
-        "title": "Train Station & Directions (駅と道案内)",
+        "title": "Train Station & Directions (駅 (えき) と道案内 (みちあんない))",
         "context": "The student is navigating a Tokyo train station or asking for street directions.",
         "items": [
-            {"japanese": "東京駅はどこですか。", "romaji": "Toukyou eki wa doko desu ka.", "english": "Where is Tokyo Station?", "tip": "〜はどこですか = Where is ~?"},
-            {"japanese": "この電車は新宿に行きますか。", "romaji": "Kono densha wa Shinjuku ni ikimasu ka.", "english": "Does this train go to Shinjuku?", "tip": "〜に行きますか = Does it go to ~?"},
-            {"japanese": "何番線ですか。", "romaji": "Nanban-sen desu ka.", "english": "Which track / platform number is it?", "tip": "番線 (bansen) = platform track number."},
-            {"japanese": "まっすぐ行って、右に曲がってください。", "romaji": "Massugu itte, migi ni magatte kudasai.", "english": "Go straight and turn right.", "tip": "まっすぐ = straight, 右 = right, 左 = left."},
-            {"japanese": "歩いて五分くらいです。", "romaji": "Aruite gofun kurai desu.", "english": "It is about a 5-minute walk.", "tip": "歩いて (aruite) = by walking, くらい = about."},
+            {"japanese": "東京駅 (とうきょうえき) はどこですか。", "romaji": "Toukyou eki wa doko desu ka.", "english": "Where is Tokyo Station?", "tip": "〜はどこですか = Where is ~?"},
+            {"japanese": "この電車 (でんしゃ) は新宿 (しんじゅく) に行 (い) きますか。", "romaji": "Kono densha wa Shinjuku ni ikimasu ka.", "english": "Does this train go to Shinjuku?", "tip": "〜に行きますか = Does it go to ~?"},
+            {"japanese": "何番線 (なんばんせん) ですか。", "romaji": "Nanban-sen desu ka.", "english": "Which track / platform number is it?", "tip": "番線 (bansen) = platform track number."},
+            {"japanese": "まっすぐ行 (い) って、右 (みぎ) に曲 (ま) がってください。", "romaji": "Massugu itte, migi ni magatte kudasai.", "english": "Go straight and turn right.", "tip": "まっすぐ = straight, 右 = right, 左 = left."},
+            {"japanese": "歩 (ある) いて五分 (ごふん) くらいです。", "romaji": "Aruite gofun kurai desu.", "english": "It is about a 5-minute walk.", "tip": "歩いて (aruite) = by walking, くらい = about."},
         ]
     },
     {
-        "title": "Convenience Store & Shopping (コンビニとお買い物)",
+        "title": "Convenience Store & Shopping (コンビニとお買 (か) い物 (もの))",
         "context": "The student is buying items at a convenience store or market.",
         "items": [
-            {"japanese": "袋はいりません。", "romaji": "Fukuro wa irimasen.", "english": "I do not need a plastic bag.", "tip": "袋 (fukuro) = bag. いりません = don't need."},
-            {"japanese": "温めますか。", "romaji": "Atatamemasu ka.", "english": "Would you like this heated up / microwaved?", "tip": "Common cashier question for bento: reply 'はい、お願いします' (Yes please)."},
-            {"japanese": "お箸を一つつけてください。", "romaji": "Ohashi o hitotsu tsukete kudasai.", "english": "Please include one pair of chopsticks.", "tip": "お箸 (ohashi) = chopsticks."},
-            {"japanese": "レシートは大丈夫です。", "romaji": "Reshiito wa daijoubu desu.", "english": "No receipt needed, thanks.", "tip": "大丈夫です = It's okay / no thanks."},
-            {"japanese": "おすすめは何ですか。", "romaji": "Osusume wa nan desu ka.", "english": "What do you recommend?", "tip": "おすすめ (osusume) = recommendation."},
+            {"japanese": "袋 (ふくろ) はいりません。", "romaji": "Fukuro wa irimasen.", "english": "I do not need a plastic bag.", "tip": "袋 (fukuro) = bag. いりません = don't need."},
+            {"japanese": "温 (あたた) めますか。", "romaji": "Atatamemasu ka.", "english": "Would you like this heated up / microwaved?", "tip": "Common cashier question for bento: reply 'はい、お願いします' (Yes please)."},
+            {"japanese": "お箸 (おはし) を一つ (ひとつ) つけてください。", "romaji": "Ohashi o hitotsu tsukete kudasai.", "english": "Please include one pair of chopsticks.", "tip": "お箸 (ohashi) = chopsticks."},
+            {"japanese": "レシートは大丈夫 (だいじょうぶ) です。", "romaji": "Reshiito wa daijoubu desu.", "english": "No receipt needed, thanks.", "tip": "大丈夫です = It's okay / no thanks."},
+            {"japanese": "おすすめは何 (なん) ですか。", "romaji": "Osusume wa nan desu ka.", "english": "What do you recommend?", "tip": "おすすめ (osusume) = recommendation."},
         ]
     },
     {
-        "title": "Daily Routine & Weekend Plans (日常会話とお誘い)",
+        "title": "Daily Routine & Weekend Plans (日常会話 (にちじょうかいわ) とお誘 (さそ) い)",
         "context": "Chatting about weekend plans, invitations, and meeting friends.",
         "items": [
-            {"japanese": "今週末、何をしますか。", "romaji": "Konshuumatsu, nani o shimasu ka.", "english": "What are you doing this weekend?", "tip": "今週末 (konshuumatsu) = this weekend."},
-            {"japanese": "いっしょにお昼ご飯を食べませんか。", "romaji": "Issho ni ohirugohan o tabemasen ka.", "english": "Would you like to have lunch together?", "tip": "〜ませんか is a polite invitation ('Won't you ~?')."},
-            {"japanese": "いいですね！行きましょう。", "romaji": "Ii desu ne! Ikimashou.", "english": "Sounds great! Let's go.", "tip": "〜ましょう expresses enthusiastic agreement."},
-            {"japanese": "何時に会いましょうか。", "romaji": "Nanji ni aimashou ka.", "english": "What time shall we meet?", "tip": "何時 (nanji) = what time."},
-            {"japanese": "楽しみにしています！", "romaji": "Tanoshimi ni shite imasu!", "english": "I am really looking forward to it!", "tip": "Classic polite closing when planning an outing."},
+            {"japanese": "今週末 (こんしゅうまつ)、何 (なに) をしますか。", "romaji": "Konshuumatsu, nani o shimasu ka.", "english": "What are you doing this weekend?", "tip": "今週末 (konshuumatsu) = this weekend."},
+            {"japanese": "いっしょにお昼 (ひる) ご飯 (はん) を食 (た) べませんか。", "romaji": "Issho ni ohirugohan o tabemasen ka.", "english": "Would you like to have lunch together?", "tip": "〜ませんか is a polite invitation ('Won't you ~?')."},
+            {"japanese": "いいですね！行 (い) きましょう。", "romaji": "Ii desu ne! Ikimashou.", "english": "Sounds great! Let's go.", "tip": "〜ましょう expresses enthusiastic agreement."},
+            {"japanese": "何時 (なんじ) に会 (あ) いましょうか。", "romaji": "Nanji ni aimashou ka.", "english": "What time shall we meet?", "tip": "何時 (nanji) = what time."},
+            {"japanese": "楽 (たの) しみにしています！", "romaji": "Tanoshimi ni shite imasu!", "english": "I am really looking forward to it!", "tip": "Classic polite closing when planning an outing."},
         ]
     },
     {
-        "title": "Asking for Help & Clarification (困った時の日本語)",
+        "title": "Asking for Help & Clarification (困 (こま) った時 (とき) の日本語 (にほんご))",
         "context": "Essential survival phrases when in Japan needing clarification or help.",
         "items": [
-            {"japanese": "日本語がまだ上手ではありません。", "romaji": "Nihongo ga mada jouzu dewa arimasen.", "english": "My Japanese is not very good yet.", "tip": "Modest and practical way to set expectations."},
-            {"japanese": "もう一度ゆっくり言ってください。", "romaji": "Mou ichido yukkuri itte kudasai.", "english": "Please say it once more slowly.", "tip": "もう一度 (mou ichido) = once more, ゆっくり (yukkuri) = slowly."},
-            {"japanese": "これは日本語で何と言いますか。", "romaji": "Kore wa nihongo de nan to iimasu ka.", "english": "How do you say this in Japanese?", "tip": "Essential phrase for asking Japanese equivalents."},
-            {"japanese": "書いてもらえますか。", "romaji": "Kaite moraemasu ka.", "english": "Could you write it down for me?", "tip": "Helpful when unfamiliar with kanji or fast speech."},
-            {"japanese": "助かりました。ありがとうございます！", "romaji": "Tasukarimashita. Arigatou gozaimasu!", "english": "That was a lifesaver. Thank you so much!", "tip": "助かりました = 'You really helped me out / That saved me.'"},
+            {"japanese": "日本語 (にほんご) がまだ上手 (じょうず) ではありません。", "romaji": "Nihongo ga mada jouzu dewa arimasen.", "english": "My Japanese is not very good yet.", "tip": "Modest and practical way to set expectations."},
+            {"japanese": "もう一度 (いちど) ゆっくり言 (い) ってください。", "romaji": "Mou ichido yukkuri itte kudasai.", "english": "Please say it once more slowly.", "tip": "もう一度 (mou ichido) = once more, ゆっくり (yukkuri) = slowly."},
+            {"japanese": "これは日本語 (にほんご) で何 (なん) と言 (い) いますか。", "romaji": "Kore wa nihongo de nan to iimasu ka.", "english": "How do you say this in Japanese?", "tip": "Essential phrase for asking Japanese equivalents."},
+            {"japanese": "書 (か) いてもらえますか。", "romaji": "Kaite moraemasu ka.", "english": "Could you write it down for me?", "tip": "Helpful when unfamiliar with kanji or fast speech."},
+            {"japanese": "助 (たす) かりました。ありがとうございます！", "romaji": "Tasukarimashita. Arigatou gozaimasu!", "english": "That was a lifesaver. Thank you so much!", "tip": "助かりました = 'You really helped me out / That saved me.'"},
         ]
     }
 ]
@@ -466,11 +466,14 @@ STUDENT PROGRESS PROFILE:
 HIDDEN PRIVATE LESSON QUEUE (INTERNAL CHECKLIST FOR SENSEI ONLY):
 {lesson_queue_str}
 
+GLOBAL MANDATE — ALWAYS PAIR KANJI WITH HIRAGANA EVERYWHERE:
+NEVER output standalone Kanji anywhere—neither in spoken transcripts nor in push_whiteboard_card. Whenever ANY Kanji appears, you MUST ALWAYS include its Hiragana reading right next to it in parentheses (e.g., 携帯 (けいたい), 上手ですね (じょうずですね), お茶 (おちゃ)). Never write or display bare Kanji alone without Hiragana furigana reading.
+
 SITUATION-BASED ROLEPLAY & TEACHING RULES:
 1. SCENARIO-FIRST TEACHING:
    Never run a mechanical flashcard viva or repeat-after-me drill. Instead, anchor every set of words in a relatable 1-sentence real-life scenario that fits the target vocabulary (e.g., entering a Tokyo café, greeting a coworker in the office, introducing your family, ordering at an izakaya, or buying a train ticket). Set the scene vividly in 1 sentence!
 2. IN-CHARACTER ROLEPLAY LOOP:
-   Act as the conversation partner (barista, friend, coworker, station attendant, shopkeeper). Introduce 1 word/phrase at a time on the whiteboard using push_whiteboard_card, explain briefly how it fits the situation, and prompt the student to reply in character (e.g., "いらっしゃいませ！ Welcome to the café! Try asking for green tea: お茶をください (Ocha o kudasai)!").
+   Act as the conversation partner (barista, friend, coworker, station attendant, shopkeeper). Introduce 1 word/phrase at a time on the whiteboard using push_whiteboard_card, explain briefly how it fits the situation, and prompt the student to reply in character (e.g., "いらっしゃいませ！ Welcome to the café! Try asking for green tea: お茶 (おちゃ) をください (Ocha o kudasai)!").
 3. NATURAL, VARIED FEEDBACK (NO ROBOTIC PRAISE):
    NEVER repeat the same robotic opener like "上手ですね！" every single turn. Vary your reactions naturally and genuinely:
    - "いいですね！" (Nice!)
@@ -480,8 +483,8 @@ SITUATION-BASED ROLEPLAY & TEACHING RULES:
    - Or simply react in character as your roleplay persona and keep the dialogue flowing!
 4. MAX 2 RETRIES (NEVER TRAP IN LOOPS):
    Never trap the student in an endless pronunciation loop. Allow at most 2 gentle retries on a word. If the student is close, or after 2 attempts, offer one quick friendly tip and immediately advance the story/dialogue.
-5. HIRAGANA ON WHITEBOARD:
-   Whenever calling push_whiteboard_card with Kanji, ALWAYS include the Hiragana reading alongside Romaji (e.g., 携帯 (けいたい)).
+5. ALWAYS PAIR KANJI WITH HIRAGANA (WHITEBOARD & TRANSCRIPTS):
+   NEVER output standalone Kanji anywhere. Whenever calling push_whiteboard_card or writing/speaking Japanese containing Kanji, ALWAYS include the Hiragana reading right next to it in parentheses (e.g., 携帯 (けいたい), 上手ですね (じょうずですね), お茶 (おちゃ)).
 6. SHORT & SPOKEN (1–3 SENTENCES MAX):
    Keep Sensei's spoken turns short and conversational (1 to 3 sentences maximum). It must feel like a lively, natural back-and-forth chat with a human friend, not a lecture or textbook reading.
 7. SILENT TOOL CALLS (ZERO DOUBLE-SPEAKING):
@@ -498,7 +501,7 @@ SITUATION-BASED ROLEPLAY & TEACHING RULES:
 
 def push_whiteboard_card(japanese: str, romaji: str, english: str, tip: str = "") -> str:
     """Display a Japanese vocabulary, kanji, kana, or grammar card on the student's interactive whiteboard.
-    IMPORTANT: Whenever 'japanese' contains Kanji, always include the Hiragana reading alongside Romaji, e.g. '携帯 (けいたい)'."""
+    CRITICAL GLOBAL RULE: NEVER output standalone Kanji anywhere. Whenever 'japanese' contains Kanji, always include its Hiragana reading right next to it in parentheses, e.g. '携帯 (けいたい)', '上手ですね (じょうずですね)', 'お茶 (おちゃ)'."""
     return f"Card for {japanese} ({romaji}) displayed on whiteboard."
 
 

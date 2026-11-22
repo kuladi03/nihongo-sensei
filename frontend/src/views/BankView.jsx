@@ -279,6 +279,7 @@ export default function BankView() {
                     <JpText
                       japanese={item.japanese || item.kana_only}
                       romaji={item.romaji}
+                      kana={item.kana_only}
                       size="xl"
                       align="left"
                     />

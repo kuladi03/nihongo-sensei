@@ -58,6 +58,7 @@ from db.database import (
     mark_user_unit_completed,
     get_user_mastery_item,
     save_user_mastery,
+    batch_submit_progress,
     get_user_due_mastery_items,
     get_user_bank_items,
     get_user_live_sessions,
@@ -947,95 +948,17 @@ async def submit_progress(request: Request):
         raise HTTPException(status_code=400, detail="unit_number is required.")
 
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        boss_agent = MemoryBossAgent()
-        updated_items = []
-        for g in grades:
-            raw_id = g.get("item_id")
-            q = int(g.get("quality", 4))
-            real_item_id = None
-
-            if raw_id is not None:
-                try:
-                    cur.execute("SELECT id FROM mastery_items WHERE id = ?", (int(raw_id),))
-                    row = cur.fetchone()
-                    if row:
-                        real_item_id = row["id"]
-                except (ValueError, TypeError):
-                    pass
-
-            if not real_item_id:
-                target_text = g.get("target") or g.get("japanese") or g.get("text")
-                if target_text:
-                    clean_text = str(target_text).strip().rstrip("。！？.!?")
-                    cur.execute(
-                        "SELECT id FROM mastery_items WHERE japanese = ? OR kana_only = ? LIMIT 1",
-                        (clean_text, clean_text)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        real_item_id = row["id"]
-
-            if not real_item_id:
-                continue
-
-            curr = get_user_mastery_item(user["id"], real_item_id)
-            ef = curr["ease_factor"] if curr else 2.5
-            iv = curr["interval_days"] if curr else 1
-            rep = curr["repetitions"] if curr else 0
-            wc = curr["wrong_count"] if curr else 0
-
-            new_ef, new_iv, new_rep = boss_agent.calculate_sm2(q, ef, iv, rep)
-            new_iv = max(1, min(int(new_iv), 365))
-            new_wc = wc + 1 if q < 3 else wc
-            next_date = (date.today() + timedelta(days=new_iv)).isoformat()
-
-            save_user_mastery(
-                user_id=user["id"],
-                item_id=real_item_id,
-                ease_factor=new_ef,
-                interval_days=new_iv,
-                repetitions=new_rep,
-                wrong_count=new_wc,
-                next_review_date=next_date
-            )
-            updated_items.append({"item_id": real_item_id, "quality": q, "repetitions": new_rep})
-
-        conn.close()
-
-        if is_completed:
-            mark_user_unit_completed(user["id"], int(unit_number), True, accuracy=accuracy)
-            new_streak = max(user.get("streak", 0) + 1, 1)
-            update_user_stats(user["id"], xp_delta=earned_xp, streak=new_streak)
-        else:
-            new_streak = max(user.get("streak", 0), 1)
-            update_user_stats(user["id"], xp_delta=earned_xp, streak=new_streak)
-
-        boss_unit = boss_agent.maybe_generate_boss_unit()
-        fresh_user = get_user_by_id(user["id"])
-        new_xp = fresh_user["xp"] if fresh_user else user.get("xp", 0)
-        curr_streak = fresh_user["streak"] if fresh_user else user.get("streak", 0)
-
-        # Invalidate read cache for user
-        invalidate_cache(f"roadmap:{user['id']}")
-        invalidate_cache(f"bank:{user['id']}")
-        invalidate_cache_prefix(f"due:{user['id']}")
-        invalidate_cache(f"user:id:{user['id']}")
-
-        return {
-            "status": "ok",
-            "earned_xp": earned_xp,
-            "total_xp": new_xp,
-            "streak": curr_streak,
-            "unit_completed": int(unit_number) if is_completed else None,
-            "user_xp": new_xp,
-            "user_streak": curr_streak,
-            "unit_number": int(unit_number),
-            "is_completed": is_completed,
-            "updated_mastery_items": len(updated_items),
-            "boss_unit_unlocked": boss_unit is not None,
-        }
+        # Offload DB batch execution to worker thread (zero event loop blocking)
+        result = await asyncio.to_thread(
+            batch_submit_progress,
+            user_id=user["id"],
+            unit_number=int(unit_number),
+            grades=grades,
+            is_completed=is_completed,
+            accuracy=accuracy,
+            earned_xp=earned_xp,
+        )
+        return result
     except Exception as e:
         logger.exception("❌ [PROGRESS_SUBMIT] Failed to submit progress: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

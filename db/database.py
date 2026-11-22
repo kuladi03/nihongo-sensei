@@ -1,11 +1,14 @@
 import os
 import sqlite3
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+
+logger = logging.getLogger("database")
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "nihongo.db"
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
@@ -813,6 +816,227 @@ def save_user_mastery(
     conn.close()
     CACHE.invalidate(f"bank:{user_id}")
     CACHE.invalidate_prefix(f"due:{user_id}")
+
+def compute_sm2_update(quality: int, current_ef: float = 2.5, current_iv: int = 1, current_rep: int = 0) -> Tuple[float, int, int]:
+    q = max(0, min(5, int(quality)))
+    if q < 3:
+        new_reps = 0
+        new_iv = 1
+    else:
+        if current_rep == 0:
+            new_iv = 1
+        elif current_rep == 1:
+            new_iv = 6
+        else:
+            new_iv = max(1, min(round(current_iv * current_ef), 365))
+        new_reps = current_rep + 1
+
+    new_iv = max(1, min(int(new_iv), 365))
+    new_ef = current_ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02))
+    new_ef = max(1.3, round(new_ef, 3))
+    return new_ef, new_iv, new_reps
+
+def batch_submit_progress(
+    user_id: int,
+    unit_number: int,
+    grades: List[Dict[str, Any]],
+    is_completed: bool = False,
+    accuracy: float = 1.0,
+    earned_xp: int = 50,
+) -> Dict[str, Any]:
+    """
+    Submits user drill or unit progress in a single database transaction with minimal round-trips:
+    - Resolves all submitted item IDs in a single query.
+    - Fetches all current mastery states in a single query.
+    - Computes updated SM-2 parameters in Python memory.
+    - Writes all user_mastery updates using a single multi-row INSERT ... ON CONFLICT statement (1 round-trip on Turso/Hrana).
+    - Upserts unit completion and updates user stats/streak in the same transaction.
+    - Commits once at the end.
+    - Only checks boss milestone if is_completed and unit_number % 5 == 0.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Resolve submitted items in batch
+        raw_ids: set[int] = set()
+        text_targets: set[str] = set()
+        for g in grades:
+            raw_id = g.get("item_id")
+            if raw_id is not None:
+                try:
+                    raw_ids.add(int(raw_id))
+                except (ValueError, TypeError):
+                    pass
+            else:
+                target_text = g.get("target") or g.get("japanese") or g.get("text")
+                if target_text:
+                    clean_text = str(target_text).strip().rstrip("。！？.!?")
+                    if clean_text:
+                        text_targets.add(clean_text)
+
+        id_to_real_id: Dict[int, int] = {}
+        text_to_real_id: Dict[str, int] = {}
+
+        if raw_ids:
+            ph = ", ".join(["?"] * len(raw_ids))
+            cur.execute(f"SELECT id FROM mastery_items WHERE id IN ({ph})", tuple(raw_ids))
+            for row in cur.fetchall():
+                id_to_real_id[row["id"]] = row["id"]
+
+        if text_targets:
+            ph = ", ".join(["?"] * len(text_targets))
+            cur.execute(
+                f"SELECT id, japanese, kana_only FROM mastery_items WHERE japanese IN ({ph}) OR kana_only IN ({ph})",
+                tuple(text_targets) + tuple(text_targets),
+            )
+            for row in cur.fetchall():
+                if row["japanese"]:
+                    text_to_real_id[row["japanese"].strip().rstrip("。！？.!?")] = row["id"]
+                if row["kana_only"]:
+                    text_to_real_id[row["kana_only"].strip().rstrip("。！？.!?")] = row["id"]
+
+        # Map each grade to its resolved item_id
+        resolved_grades: List[Tuple[int, int]] = [] # (item_id, quality)
+        for g in grades:
+            raw_id = g.get("item_id")
+            q = int(g.get("quality", 4))
+            real_id = None
+            if raw_id is not None:
+                try:
+                    real_id = id_to_real_id.get(int(raw_id))
+                except (ValueError, TypeError):
+                    pass
+            if not real_id:
+                target_text = g.get("target") or g.get("japanese") or g.get("text")
+                if target_text:
+                    clean_text = str(target_text).strip().rstrip("。！？.!?")
+                    real_id = text_to_real_id.get(clean_text)
+            if real_id:
+                resolved_grades.append((real_id, q))
+
+        resolved_ids = list({item_id for item_id, _ in resolved_grades})
+
+        # 2. Batch fetch existing user_mastery
+        curr_mastery: Dict[int, Dict[str, Any]] = {}
+        if resolved_ids:
+            ph = ", ".join(["?"] * len(resolved_ids))
+            cur.execute(
+                f"SELECT item_id, ease_factor, interval_days, repetitions, wrong_count FROM user_mastery WHERE user_id = ? AND item_id IN ({ph})",
+                (user_id, *resolved_ids),
+            )
+            for row in cur.fetchall():
+                curr_mastery[row["item_id"]] = dict(row)
+
+        # 3. Compute updated SM-2 states in memory
+        mastery_rows: Dict[int, Tuple] = {} # item_id -> (user_id, item_id, ef, iv, rep, wc, next_date)
+        updated_items: List[Dict[str, Any]] = []
+
+        for item_id, q in resolved_grades:
+            if item_id in mastery_rows:
+                _, _, ef, iv, rep, wc, _ = mastery_rows[item_id]
+            else:
+                curr = curr_mastery.get(item_id)
+                ef = float(curr["ease_factor"]) if curr and curr["ease_factor"] is not None else 2.5
+                iv = int(curr["interval_days"]) if curr and curr["interval_days"] is not None else 1
+                rep = int(curr["repetitions"]) if curr and curr["repetitions"] is not None else 0
+                wc = int(curr["wrong_count"]) if curr and curr["wrong_count"] is not None else 0
+
+            new_ef, new_iv, new_rep = compute_sm2_update(q, ef, iv, rep)
+            new_wc = wc + 1 if q < 3 else wc
+            next_date = (date.today() + timedelta(days=new_iv)).isoformat()
+
+            mastery_rows[item_id] = (user_id, item_id, new_ef, new_iv, new_rep, new_wc, next_date)
+            updated_items.append({"item_id": item_id, "quality": q, "repetitions": new_rep})
+
+        # 4. Multi-Row INSERT INTO user_mastery (Single network round-trip for all items)
+        if mastery_rows:
+            rows_to_insert = list(mastery_rows.values())
+            values_clause = ", ".join(["(?, ?, ?, ?, ?, ?, ?)"] * len(rows_to_insert))
+            flattened_params = [val for row in rows_to_insert for val in row]
+            cur.execute(f"""
+                INSERT INTO user_mastery (
+                    user_id, item_id, ease_factor, interval_days, repetitions, wrong_count, next_review_date
+                ) VALUES {values_clause}
+                ON CONFLICT(user_id, item_id) DO UPDATE SET
+                    ease_factor = excluded.ease_factor,
+                    interval_days = excluded.interval_days,
+                    repetitions = excluded.repetitions,
+                    wrong_count = excluded.wrong_count,
+                    next_review_date = excluded.next_review_date
+            """, flattened_params)
+
+        # 5. Unit progress upsert if unit is completed
+        if is_completed:
+            cur.execute("""
+                INSERT INTO user_unit_progress (user_id, unit_number, is_completed, best_accuracy, completed_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, unit_number) DO UPDATE SET
+                    is_completed = MAX(user_unit_progress.is_completed, excluded.is_completed),
+                    best_accuracy = MAX(user_unit_progress.best_accuracy, excluded.best_accuracy),
+                    completed_at = CURRENT_TIMESTAMP
+            """, (user_id, int(unit_number), 1, float(accuracy)))
+
+        # 6. Update user XP and streak in the same query via RETURNING (reduces total queries to <= 5)
+        try:
+            cur.execute("""
+                UPDATE users
+                SET xp = MAX(0, xp + ?),
+                    streak = CASE WHEN ? = 1 THEN MAX(COALESCE(streak, 0) + 1, 1) ELSE MAX(COALESCE(streak, 0), 1) END
+                WHERE id = ?
+                RETURNING xp, streak
+            """, (earned_xp, 1 if is_completed else 0, user_id))
+            user_row = cur.fetchone()
+        except Exception:
+            # Fallback for environments without RETURNING support
+            cur.execute("""
+                UPDATE users
+                SET xp = MAX(0, xp + ?),
+                    streak = CASE WHEN ? = 1 THEN MAX(COALESCE(streak, 0) + 1, 1) ELSE MAX(COALESCE(streak, 0), 1) END
+                WHERE id = ?
+            """, (earned_xp, 1 if is_completed else 0, user_id))
+            cur.execute("SELECT xp, streak FROM users WHERE id = ?", (user_id,))
+            user_row = cur.fetchone()
+
+        new_xp = user_row["xp"] if user_row else 0
+        curr_streak = user_row["streak"] if user_row else 1
+
+        # Single transaction commit
+        conn.commit()
+
+    finally:
+        conn.close()
+
+    # Invalidate in-memory caches
+    CACHE.invalidate(f"bank:{user_id}")
+    CACHE.invalidate_prefix(f"due:{user_id}")
+    CACHE.invalidate(f"roadmap:{user_id}")
+    CACHE.invalidate(f"user:id:{user_id}")
+    CACHE.invalidate_prefix(f"user:{user_id}")
+
+    # 7. Zero-overhead Boss milestone check: only runs when unit is completed AND is a multiple of 5
+    boss_unit_unlocked = False
+    if is_completed and int(unit_number) > 0 and int(unit_number) % 5 == 0:
+        try:
+            from agents.memory_boss_agent import MemoryBossAgent
+            boss_agent = MemoryBossAgent()
+            boss_unit = boss_agent.maybe_generate_boss_unit()
+            boss_unit_unlocked = boss_unit is not None
+        except Exception as e:
+            logger.warning("Failed boss unit check for unit %s: %s", unit_number, e)
+
+    return {
+        "status": "ok",
+        "earned_xp": earned_xp,
+        "total_xp": new_xp,
+        "streak": curr_streak,
+        "unit_completed": int(unit_number) if is_completed else None,
+        "user_xp": new_xp,
+        "user_streak": curr_streak,
+        "unit_number": int(unit_number),
+        "is_completed": is_completed,
+        "updated_mastery_items": len(updated_items),
+        "boss_unit_unlocked": boss_unit_unlocked,
+    }
 
 def get_user_due_mastery_items(user_id: int, limit: int = 30) -> List[Dict[str, Any]]:
     cache_key = f"due:{user_id}:{limit}"

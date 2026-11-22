@@ -1061,7 +1061,12 @@ export default function LiveSenseiView() {
                           >
                             <div className="flex items-start justify-between gap-2 mb-1.5">
                               <div className="text-base font-bold text-stone-900 font-japanese">
-                                <JpText japanese={card.japanese} romaji={card.romaji} />
+                                <JpText japanese={card.japanese} romaji={card.romaji} kana={card.kana_only || card.hiragana} />
+                                {card.kana_only && card.kana_only !== card.japanese && (
+                                  <div className="text-xs font-bold text-[#4A7C59] font-japanese mt-0.5">
+                                    {card.kana_only}
+                                  </div>
+                                )}
                               </div>
                               {card.romaji && (
                                 <span className="px-2 py-0.5 rounded-md bg-white border border-[#E5E0D8] font-mono text-[10px] font-semibold text-stone-600">
@@ -1495,7 +1500,12 @@ export default function LiveSenseiView() {
                     <div className="flex items-start justify-between gap-2 mb-1.5">
                       {/* Main Japanese Script + Romaji via JpText */}
                       <div className="text-base font-bold text-stone-900 font-japanese">
-                        <JpText japanese={card.japanese} romaji={card.romaji} />
+                        <JpText japanese={card.japanese} romaji={card.romaji} kana={card.kana_only || card.hiragana} />
+                        {card.kana_only && card.kana_only !== card.japanese && (
+                          <div className="text-xs font-bold text-[#4A7C59] font-japanese mt-0.5">
+                            {card.kana_only}
+                          </div>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-1.5">

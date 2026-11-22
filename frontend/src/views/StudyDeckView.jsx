@@ -102,6 +102,7 @@ export default function StudyDeckView() {
               <JpText
                 japanese={currentCard.japanese || currentCard.kana_only}
                 romaji={currentCard.romaji}
+                kana={currentCard.kana_only}
                 size="3xl"
               />
               {currentCard.kana_only && currentCard.kana_only !== currentCard.japanese && (

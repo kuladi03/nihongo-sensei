@@ -11,6 +11,7 @@ import {
   Trophy,
   ArrowRight,
   RefreshCw,
+  Loader2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import confetti from 'canvas-confetti';
@@ -32,6 +33,7 @@ export default function ExercisePlayerView() {
   const [isCorrect, setIsCorrect] = useState(false);
   const [resultsLog, setResultsLog] = useState([]);
   const [isCompleted, setIsCompleted] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const currentExercise = exercises[currentIndex];
   const totalExercises = exercises.length;
@@ -172,25 +174,31 @@ export default function ExercisePlayerView() {
     if (currentIndex < totalExercises - 1) {
       setCurrentIndex(prev => prev + 1);
     } else {
-      confetti({ particleCount: 120, spread: 90, origin: { y: 0.6 } });
-      const correctCount = resultsLog.filter(r => r.isCorrect).length;
-      const accuracy = totalExercises > 0 ? correctCount / totalExercises : 1.0;
-      const earnedXp = correctCount * 15 + 50;
+      if (isSubmitting) return;
+      setIsSubmitting(true);
+      try {
+        confetti({ particleCount: 120, spread: 90, origin: { y: 0.6 } });
+        const correctCount = resultsLog.filter(r => r.isCorrect).length;
+        const accuracy = totalExercises > 0 ? correctCount / totalExercises : 1.0;
+        const earnedXp = correctCount * 15 + 50;
 
-      const grades = resultsLog.map((r, i) => {
-        const ex = activeUnit?.exercises?.[i];
-        const card = activeUnit?.study_cards?.[i];
-        return {
-          item_id: ex?.item_id || card?.id || null,
-          target: ex?.target_phrase || ex?.target_kana || card?.japanese || null,
-          quality: r.quality,
-        };
-      });
+        const grades = resultsLog.map((r, i) => {
+          const ex = activeUnit?.exercises?.[i];
+          const card = activeUnit?.study_cards?.[i];
+          return {
+            item_id: ex?.item_id || card?.id || null,
+            target: ex?.target_phrase || ex?.target_kana || card?.japanese || null,
+            quality: r.quality,
+          };
+        });
 
-      await submitProgress(activeUnit?.unit_number, true, grades, earnedXp, accuracy);
-      setIsCompleted(true);
+        await submitProgress(activeUnit?.unit_number, true, grades, earnedXp, accuracy);
+        setIsCompleted(true);
+      } finally {
+        setIsSubmitting(false);
+      }
     }
-  }, [currentIndex, totalExercises, resultsLog, activeUnit, submitProgress]);
+  }, [currentIndex, totalExercises, resultsLog, activeUnit, submitProgress, isSubmitting]);
 
   // Enter Key Listener to Check or Continue
   useEffect(() => {
@@ -203,6 +211,7 @@ export default function ExercisePlayerView() {
 
       if (e.key === 'Enter') {
         e.preventDefault();
+        if (isSubmitting) return;
         if (!hasChecked) {
           handleCheck();
         } else {
@@ -213,7 +222,7 @@ export default function ExercisePlayerView() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [hasChecked, handleCheck, handleContinue]);
+  }, [hasChecked, handleCheck, handleContinue, isSubmitting]);
 
   // Completion Screen
   if (!currentExercise || isCompleted) {
@@ -380,7 +389,18 @@ export default function ExercisePlayerView() {
                       : "bg-white hover:bg-[#F5F3EF] border-[#E5E0D8] text-stone-900"
                   }`}
                 >
-                  <JpText japanese={optItem.text} romaji={optItem.romaji} size="md" align="left" />
+                  <JpText
+                    japanese={optItem.text}
+                    romaji={optItem.romaji}
+                    kana={optItem.kana_only || optItem.hiragana}
+                    size="md"
+                    align="left"
+                  />
+                  {optItem.kana_only && optItem.kana_only !== optItem.text && (
+                    <div className="text-xs font-semibold text-[#4A7C59] font-japanese mt-0.5">
+                      {optItem.kana_only}
+                    </div>
+                  )}
 
                   <div
                     className={`w-6 h-6 rounded-full border flex items-center justify-center text-xs font-bold flex-shrink-0 ml-3 ${
@@ -410,6 +430,7 @@ export default function ExercisePlayerView() {
                 rankedItems.map((item, i) => {
                   const text = typeof item === 'object' ? item.text : item;
                   const romaji = typeof item === 'object' ? item.romaji : "";
+                  const kana = typeof item === 'object' ? (item.kana_only || item.hiragana) : "";
                   return (
                     <span
                       key={i}
@@ -417,7 +438,7 @@ export default function ExercisePlayerView() {
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#EDF5EF] border border-[#C5DEC9] text-[#233E2B] font-bold text-sm cursor-pointer hover:bg-[#D1E7D6] shadow-xs"
                     >
                       <span className="text-xs font-extrabold text-[#233E2B]/70">{i + 1}.</span>
-                      <JpText japanese={text} romaji={romaji} size="xs" />
+                      <JpText japanese={text} romaji={romaji} kana={kana} size="xs" />
                       <X size={13} className="text-[#233E2B]/60 ml-0.5" />
                     </span>
                   );
@@ -440,7 +461,12 @@ export default function ExercisePlayerView() {
                         : "bg-white hover:bg-[#F5F3EF] text-stone-900 border-[#E5E0D8] active:scale-95"
                     }`}
                   >
-                    <JpText japanese={optItem.text} romaji={optItem.romaji} size="sm" />
+                    <JpText
+                      japanese={optItem.text}
+                      romaji={optItem.romaji}
+                      kana={optItem.kana_only || optItem.hiragana}
+                      size="sm"
+                    />
                   </button>
                 );
               })}
@@ -459,6 +485,7 @@ export default function ExercisePlayerView() {
                 tileAnswer.map((tile, i) => {
                   const text = typeof tile === 'object' ? tile.text : tile;
                   const romaji = typeof tile === 'object' ? tile.romaji : "";
+                  const kana = typeof tile === 'object' ? (tile.kana_only || tile.hiragana) : "";
                   return (
                     <button
                       key={i}
@@ -467,7 +494,7 @@ export default function ExercisePlayerView() {
                       onClick={() => removeTile(i)}
                       className="px-3.5 py-2 rounded-xl bg-[#EDF5EF] border border-[#C5DEC9] text-[#233E2B] font-bold text-base transition-all hover:bg-[#D1E7D6] active:scale-95 shadow-xs"
                     >
-                      <JpText japanese={text} romaji={romaji} size="sm" />
+                      <JpText japanese={text} romaji={romaji} kana={kana} size="sm" />
                     </button>
                   );
                 })
@@ -485,7 +512,12 @@ export default function ExercisePlayerView() {
                     onClick={() => addTile(tileItem)}
                     className="px-4 py-2.5 rounded-xl bg-white hover:bg-[#F5F3EF] text-stone-900 font-bold border border-[#E5E0D8] shadow-xs transition-all active:scale-95"
                   >
-                    <JpText japanese={tileItem.text} romaji={tileItem.romaji} size="sm" />
+                    <JpText
+                      japanese={tileItem.text}
+                      romaji={tileItem.romaji}
+                      kana={tileItem.kana_only || tileItem.hiragana}
+                      size="sm"
+                    />
                   </button>
                 );
               })}
@@ -500,12 +532,13 @@ export default function ExercisePlayerView() {
               <JpText
                 japanese={currentExercise.target_phrase}
                 romaji={currentExercise.target_romaji}
+                kana={currentExercise.target_kana}
                 size="2xl"
               />
             </div>
             {currentExercise.target_kana && (
-              <div className="text-sm font-semibold text-stone-500 font-japanese">
-                ({currentExercise.target_kana})
+              <div className="text-sm font-semibold text-[#4A7C59] font-japanese">
+                {currentExercise.target_kana}
               </div>
             )}
 
@@ -602,13 +635,25 @@ export default function ExercisePlayerView() {
               <button
                 type="button"
                 onClick={handleContinue}
-                className={`w-full mt-2 py-3.5 rounded-2xl font-semibold text-white transition-all active:scale-95 shadow-md ${
+                disabled={isSubmitting}
+                className={`w-full mt-2 py-3.5 rounded-2xl font-semibold text-white transition-all shadow-md flex items-center justify-center gap-1.5 ${
+                  isSubmitting ? "opacity-75 cursor-wait" : "active:scale-95"
+                } ${
                   isCorrect
                     ? "bg-[#4A7C59] hover:bg-[#355940]"
                     : "bg-[#D94E34] hover:bg-[#A63620]"
                 }`}
               >
-                Continue <ArrowRight size={18} className="inline ml-1" />
+                {isSubmitting ? (
+                  <>
+                    <Loader2 size={18} className="animate-spin inline mr-1" />
+                    Submitting...
+                  </>
+                ) : (
+                  <>
+                    Continue <ArrowRight size={18} className="inline ml-1" />
+                  </>
+                )}
               </button>
             </div>
           </motion.div>

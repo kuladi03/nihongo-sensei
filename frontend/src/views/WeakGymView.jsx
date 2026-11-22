@@ -115,6 +115,7 @@ export default function WeakGymView() {
             <JpText
               japanese={currentItem.japanese || currentItem.kana_only}
               romaji={currentItem.romaji}
+              kana={currentItem.kana_only}
               size="3xl"
             />
             {currentItem.kana_only && currentItem.kana_only !== currentItem.japanese && (

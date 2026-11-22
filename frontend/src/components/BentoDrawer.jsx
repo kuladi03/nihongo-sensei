@@ -142,7 +142,7 @@ export default function BentoDrawer({ unit, onClose }) {
                   {traps.slice(0, 3).map((trap, idx) => (
                     <div key={idx} className="p-3 rounded-xl bg-white border border-[#F5C6BC] text-xs text-stone-800 shadow-xs">
                       <div className="flex items-center gap-2 font-bold mb-1">
-                        <JpText japanese={trap.japanese || trap.kana_only} romaji={trap.romaji} size="sm" />
+                        <JpText japanese={trap.japanese || trap.kana_only} romaji={trap.romaji} kana={trap.kana_only} size="sm" />
                         <span className="text-stone-400">•</span>
                         <span className="font-marathi text-[#D94E34] font-semibold">
                           {trap.marathi_meaning || trap.marathi || trap.english_meaning}
@@ -189,7 +189,7 @@ export default function BentoDrawer({ unit, onClose }) {
                           className="w-9 h-9"
                         />
                         <div className="min-w-0">
-                          <JpText japanese={card.japanese || card.kana_only} romaji={card.romaji} size="sm" align="left" />
+                          <JpText japanese={card.japanese || card.kana_only} romaji={card.romaji} kana={card.kana_only} size="sm" align="left" />
                           <div className="text-[11px] text-stone-500 truncate mt-0.5">
                             {card.english_meaning || card.english}
                             {(card.marathi_meaning || card.marathi) && (

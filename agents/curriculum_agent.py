@@ -295,7 +295,9 @@ class CurriculumAgent:
             "number/time pattern, grammar structure, and Marathi phonetic trap from the notes. "
             "Do NOT summarize, sample, or omit basic/early items. "
             "Preserve exact Marathi explanations, nuances, and pronunciation tips from the class notes. "
-            "Assign each card an appropriate item_type ('KANA', 'VOCAB', 'GRAMMAR', 'PHRASE')."
+            "Assign each card an appropriate item_type ('KANA', 'VOCAB', 'GRAMMAR', 'PHRASE'). "
+            "CRITICAL HIRAGANA RULE: NEVER produce standalone Kanji without Hiragana reading. Whenever 'japanese' contains Kanji, "
+            "you MUST either format it inline with its Hiragana reading in parentheses (e.g. 携帯 (けいたい), お茶 (おちゃ)) OR populate 'kana_only' with the pure Hiragana reading. Never leave bare Kanji without its Hiragana reading."
         )
 
         for i, chunk in enumerate(chunks, start=1):
@@ -367,7 +369,7 @@ class CurriculumAgent:
             "   - TILE_BUILDER: Arrange scrambled word tiles into a correct sentence (options = scrambled tiles, correct_answer = full Japanese sentence).\n"
             "   - SPEAKING_CHECK: Pronunciation test for browser Web Speech API ja-JP (target_phrase = sentence to speak, prompt = what to say).\n"
             "2. If cross-unit revision items are provided, 3-4 exercises MUST test them with `is_revision_item: true`.\n"
-            "3. JAPANESE SCRIPT REQUIREMENT: Whenever an exercise asks for a Japanese word, phrase, or sentence, ALL options MUST be written in Japanese script (Hiragana, Katakana, or Kanji with Kana)—NEVER Romaji-only.\n"
+            "3. JAPANESE SCRIPT & HIRAGANA REQUIREMENT: Whenever an exercise asks for a Japanese word, phrase, or sentence, ALL options MUST be written in Japanese script (Hiragana, Katakana, or Kanji with Hiragana)—NEVER Romaji-only. CRITICAL: Every exercise prompt, target phrase, and multiple-choice option containing Kanji MUST include its Hiragana reading (either inline like 携帯 (けいたい) or populated in kana_only). Never leave bare Kanji alone.\n"
             "4. Return strictly valid structured data matching the ExercisesAndSummary schema."
         )
 
