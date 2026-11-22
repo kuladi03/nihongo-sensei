@@ -245,11 +245,31 @@ def annotate_romaji(text: str) -> str:
     romaji_str = re.sub(r'\bhe\b', 'e', romaji_str)
     return romaji_str
 
+def clean_japanese_for_tts(text: str) -> str:
+    """Strips markdown formatting, parenthetical English/romaji notes, and leaves clean Japanese text."""
+    if not text:
+        return ""
+    # Strip parenthetical English / romaji notes e.g. (Good morning), (ohayou), [Revision], etc.
+    # Matches (note) or [note] or （note） or 【note】 containing at least one Latin letter
+    cleaned = re.sub(r'[\(（\[【{][^()（）\[\]【】{}]*[a-zA-Z]+[^()（）\[\]【】{}]*[\)）\]】}]', '', str(text))
+    # Strip markdown characters (*, `, _, ~, #)
+    cleaned = re.sub(r'[*`_~#]', '', cleaned)
+    # Collapse whitespace
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned).strip()
+    return cleaned
+
+def is_japanese_phrase(text: str) -> bool:
+    """Returns True if the text contains Japanese characters (Hiragana, Katakana, or Kanji)."""
+    return any('\u3040' <= char <= '\u30ff' or '\u4e00' <= char <= '\u9faf' for char in text)
+
 async def synthesize_lazy_audio(phrase: str, filepath: Path) -> bool:
     """Lazy synthesizes Japanese audio using Edge-TTS and caches it to disk."""
     try:
+        clean_phrase = clean_japanese_for_tts(phrase)
+        if not clean_phrase:
+            return False
         os.makedirs(filepath.parent, exist_ok=True)
-        comm = edge_tts.Communicate(phrase, voice="ja-JP-NanamiNeural", rate="-10%")
+        comm = edge_tts.Communicate(clean_phrase, voice="ja-JP-NanamiNeural", rate="-10%")
         await comm.save(str(filepath))
         return filepath.exists() and filepath.stat().st_size > 0
     except Exception as e:
@@ -290,42 +310,54 @@ def require_admin(request: Request) -> dict:
 _audio_synthesis_locks: Dict[str, asyncio.Lock] = {}
 _audio_synthesis_meta_lock = asyncio.Lock()
 _audio_phrase_index: Dict[str, str] = {}
+_audio_hash_to_phrase: Dict[str, str] = _audio_phrase_index
 _audio_index_lock = threading.RLock()
 _audio_index_loaded = False
 
 def build_audio_phrase_index():
     """Builds an exhaustive mapping from audio filenames/hashes to Japanese phrases across mastery_items, kaggle_audio, and units JSON (study_cards + exercises)."""
-    global _audio_phrase_index, _audio_index_loaded
+    global _audio_phrase_index, _audio_hash_to_phrase, _audio_index_loaded
     index: Dict[str, str] = {}
+
+    def index_phrase(raw: Any):
+        if not isinstance(raw, str):
+            return
+        cleaned = clean_japanese_for_tts(raw)
+        if not cleaned or not is_japanese_phrase(cleaned):
+            return
+
+        # Direct hash mapping from phrase itself
+        h = hashlib.md5(cleaned.encode("utf-8")).hexdigest()
+        index[f"{h}.mp3"] = cleaned
+
+        # Direct hash mapping for punctuation variation (e.g. without trailing period)
+        clean_no_punct = cleaned.rstrip("。！？.!? ")
+        if clean_no_punct and clean_no_punct != cleaned:
+            h2 = hashlib.md5(clean_no_punct.encode("utf-8")).hexdigest()
+            index[f"{h2}.mp3"] = clean_no_punct
+
     try:
         conn = get_connection()
         cur = conn.cursor()
 
-        # 1. From mastery_items
-        cur.execute("SELECT japanese, kana_only, audio_path FROM mastery_items")
+        # 1. From mastery_items: only index actual Japanese phrases
+        cur.execute("SELECT japanese, kana_only FROM mastery_items")
         for row in cur.fetchall():
-            phrase = (row["kana_only"] or row["japanese"] or "").strip()
-            if phrase:
-                h = hashlib.md5(phrase.encode("utf-8")).hexdigest()
-                index[f"{h}.mp3"] = phrase
-            audio_p = row["audio_path"]
-            if audio_p and phrase:
-                fname = Path(audio_p).name
-                if fname:
-                    index[fname] = phrase
+            for fld in [row["kana_only"], row["japanese"]]:
+                if fld:
+                    index_phrase(fld)
 
-        # 2. From kaggle_audio
+        # 2. From kaggle_audio: transcripts
         cur.execute("SELECT transcript, file_path FROM kaggle_audio")
         for row in cur.fetchall():
-            tr = (row["transcript"] or "").strip()
-            fp = row["file_path"]
+            tr = row["transcript"]
             if tr:
-                h = hashlib.md5(tr.encode("utf-8")).hexdigest()
-                index[f"{h}.mp3"] = tr
+                index_phrase(tr)
+                fp = row["file_path"]
                 if fp:
                     fname = Path(fp).name
                     if fname:
-                        index[fname] = tr
+                        index[fname] = clean_japanese_for_tts(tr)
 
         # 3. From units (lesson_json: study_cards + exercises)
         cur.execute("SELECT lesson_json FROM units")
@@ -338,47 +370,25 @@ def build_audio_phrase_index():
             except Exception:
                 continue
 
-            def index_text_candidate(text: Any, explicit_audio_path: Optional[str] = None):
-                if not isinstance(text, str):
-                    return
-                clean = text.strip()
-                if not clean:
-                    return
-
-                # Direct hash mapping
-                h = hashlib.md5(clean.encode("utf-8")).hexdigest()
-                index[f"{h}.mp3"] = clean
-
-                # Cleaned Japanese punctuation mapping
-                clean_no_punct = clean.rstrip("。！？.!? ")
-                if clean_no_punct and clean_no_punct != clean:
-                    h2 = hashlib.md5(clean_no_punct.encode("utf-8")).hexdigest()
-                    index[f"{h2}.mp3"] = clean_no_punct
-
-                if explicit_audio_path:
-                    fname = Path(explicit_audio_path).name
-                    if fname:
-                        index[fname] = clean
-
+            # Study cards
             for card in data.get("study_cards", []):
-                card_audio = card.get("audio_path")
-                index_text_candidate(card.get("kana_only"), card_audio)
-                index_text_candidate(card.get("japanese"), card_audio)
+                index_phrase(card.get("kana_only"))
+                index_phrase(card.get("japanese"))
 
+            # Exercises: only index Japanese phrases, answers, and options.
+            # Never index prompt, question, or map audio_path to them!
             for ex in data.get("exercises", []):
-                ex_audio = ex.get("audio_path")
-                index_text_candidate(ex.get("target_kana"), ex_audio)
-                index_text_candidate(ex.get("target_phrase"), ex_audio)
-                index_text_candidate(ex.get("target"), ex_audio)
-                index_text_candidate(ex.get("correct_answer"), ex_audio)
-                index_text_candidate(ex.get("prompt"), ex_audio)
-                index_text_candidate(ex.get("question"), ex_audio)
+                index_phrase(ex.get("target_kana"))
+                index_phrase(ex.get("target_phrase"))
+                index_phrase(ex.get("target"))
+                index_phrase(ex.get("correct_answer"))
                 for opt in ex.get("options", []):
-                    index_text_candidate(opt)
+                    index_phrase(opt)
 
         conn.close()
         with _audio_index_lock:
             _audio_phrase_index = index
+            _audio_hash_to_phrase = index
             _audio_index_loaded = True
         logger.info("🎙️ [AUDIO_INDEX] Exhaustively indexed %d phrases for on-demand Lazy TTS.", len(index))
     except Exception as e:
@@ -404,19 +414,25 @@ async def serve_audio_file(filename: str):
 
         # Exhaustive on-demand lazy lookup
         with _audio_index_lock:
-            phrase = _audio_phrase_index.get(filename)
+            phrase = _audio_hash_to_phrase.get(filename)
             if not phrase:
                 name_no_ext = filename.replace(".mp3", "")
-                phrase = _audio_phrase_index.get(f"{name_no_ext}.mp3")
+                phrase = _audio_hash_to_phrase.get(f"{name_no_ext}.mp3")
 
         # If not indexed yet, build or refresh index from DB once
         if not phrase:
             build_audio_phrase_index()
             with _audio_index_lock:
-                phrase = _audio_phrase_index.get(filename)
+                phrase = _audio_hash_to_phrase.get(filename)
                 if not phrase:
                     name_no_ext = filename.replace(".mp3", "")
-                    phrase = _audio_phrase_index.get(f"{name_no_ext}.mp3")
+                    phrase = _audio_hash_to_phrase.get(f"{name_no_ext}.mp3")
+
+        # Direct Japanese phrase synthesis fallback if filename is {phrase}.mp3
+        if not phrase:
+            name_no_ext = filename.replace(".mp3", "")
+            if is_japanese_phrase(name_no_ext):
+                phrase = clean_japanese_for_tts(name_no_ext)
 
         if phrase:
             logger.info("🎙️ [LAZY_TTS] Generating on-demand audio for '%s' -> %s", phrase, filename)
@@ -971,6 +987,7 @@ async def submit_progress(request: Request):
             wc = curr["wrong_count"] if curr else 0
 
             new_ef, new_iv, new_rep = boss_agent.calculate_sm2(q, ef, iv, rep)
+            new_iv = max(1, min(int(new_iv), 365))
             new_wc = wc + 1 if q < 3 else wc
             next_date = (date.today() + timedelta(days=new_iv)).isoformat()
 
@@ -1041,6 +1058,7 @@ async def grade_review_item(request: Request):
         wc = curr["wrong_count"] if curr else 0
 
         new_ef, new_iv, new_rep = boss_agent.calculate_sm2(int(quality), ef, iv, rep)
+        new_iv = max(1, min(int(new_iv), 365))
         new_wc = wc + 1 if int(quality) < 3 else wc
         next_date = (date.today() + timedelta(days=new_iv)).isoformat()
 

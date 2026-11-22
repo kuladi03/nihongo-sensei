@@ -47,9 +47,10 @@ class MemoryBossAgent:
             elif reps == 1:
                 new_iv = 6
             else:
-                new_iv = max(1, round(current_iv * current_ef))
+                new_iv = max(1, min(round(current_iv * current_ef), 365))
             new_reps = reps + 1
 
+        new_iv = max(1, min(int(new_iv), 365))
         new_ef = current_ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02))
         new_ef = max(1.3, round(new_ef, 3))
         return new_ef, new_iv, new_reps
@@ -93,9 +94,10 @@ class MemoryBossAgent:
             elif repetitions == 1:
                 interval = 6
             else:
-                interval = max(1, round(interval * current_ef))
+                interval = max(1, min(round(interval * current_ef), 365))
             repetitions += 1
 
+        interval = max(1, min(int(interval), 365))
         # Calculate new ease factor
         new_ef = current_ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02))
         new_ef = max(1.3, round(new_ef, 3))

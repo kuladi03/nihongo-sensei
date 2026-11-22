@@ -1498,12 +1498,32 @@ export default function LiveSenseiView() {
                         <JpText japanese={card.japanese} romaji={card.romaji} />
                       </div>
 
-                      {/* Romaji pill */}
-                      {card.romaji && (
-                        <span className="px-2 py-0.5 rounded-md bg-white border border-[#E5E0D8] font-mono text-[10px] font-semibold text-stone-600">
-                          {card.romaji}
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1.5">
+                        {/* Manual Tap-to-Play Audio Preview (Never Auto-Played) */}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const cleanJp = (card.japanese || "").replace(/[\(（\[【][^()（）\[\]【】]*[\)）\]】]/g, '').trim();
+                            if (cleanJp) {
+                              const audio = new Audio(`/static/audio/${encodeURIComponent(cleanJp)}.mp3`);
+                              audio.play().catch(() => {});
+                            }
+                          }}
+                          className="p-1 rounded-md text-stone-400 hover:text-[#2B4C7E] hover:bg-white border border-transparent hover:border-[#E5E0D8] transition-colors cursor-pointer"
+                          title="Tap to listen to pronunciation"
+                          aria-label="Play pronunciation"
+                        >
+                          <Volume2 size={14} />
+                        </button>
+
+                        {/* Romaji pill */}
+                        {card.romaji && (
+                          <span className="px-2 py-0.5 rounded-md bg-white border border-[#E5E0D8] font-mono text-[10px] font-semibold text-stone-600">
+                            {card.romaji}
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     {/* English Meaning */}

@@ -297,11 +297,9 @@ def save_unit(
                 lesson_json = excluded.lesson_json,
                 is_completed = MAX(units.is_completed, excluded.is_completed);
         """, (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, int(is_completed)))
-        unit_id = cur.lastrowid
-        if not unit_id or unit_id == 0:
-            cur.execute("SELECT id FROM units WHERE unit_number = ?", (unit_number,))
-            row = cur.fetchone()
-            unit_id = row[0] if row else 0
+        cur.execute("SELECT id FROM units WHERE unit_number = ?", (unit_number,))
+        row = cur.fetchone()
+        unit_id = (row["id"] if isinstance(row, dict) else row[0]) if row else 0
         if close_at_end:
             conn.commit()
         # Invalidate read cache
@@ -431,6 +429,9 @@ def batch_upsert_mastery_items(
     """Batch upserts study cards for a unit within a single connection/transaction."""
     if not cards:
         return 0
+    if not unit_id or int(unit_id) <= 0:
+        raise ValueError(f"Invalid unit_id: {unit_id}. Cannot batch upsert mastery items without a valid unit.")
+    unit_id = int(unit_id)
 
     close_at_end = False
     if conn is None:
@@ -794,6 +795,7 @@ def save_user_mastery(
     wrong_count: int = 0,
     next_review_date: Optional[str] = None
 ):
+    interval_days = max(1, min(int(interval_days), 365))
     rev_date = next_review_date or date.today().isoformat()
     conn = get_connection()
     with conn:
