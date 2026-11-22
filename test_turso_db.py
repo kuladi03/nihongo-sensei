@@ -65,23 +65,38 @@ class TestTursoDatabase(unittest.TestCase):
         conn = get_connection()
         self.assertIsNotNone(conn)
         turso_active = is_turso_configured()
-        print(f"  -> Active engine: {'Turso Embedded Replica' if turso_active else 'Local SQLite (db/nihongo.db)'}")
+        print(f"  -> Active engine: {'Direct Remote Turso' if turso_active else 'Local SQLite (db/nihongo.db)'}")
         conn.close()
 
-    def test_turso_sync_method_and_replica_guard(self):
-        print("\n[TEST] 4. Testing TursoConnection sync method and replica guard...")
+    def test_turso_direct_and_cache(self):
+        print("\n[TEST] 4. Testing Direct Turso Connection singleton & In-Memory TTL Cache...")
         import libsql_experimental as libsql
         import db.database as db_mod
 
         raw = libsql.connect(":memory:")
-        conn = TursoConnection(raw)
-        # Test sync method delegation
-        sync_result = conn.sync()
-        self.assertIsNone(sync_result)  # In-memory conn has sync() which returns None
+        conn = TursoConnection(raw, is_singleton=True)
+        # Test close is a no-op when is_singleton=True
+        conn.close()
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (v TEXT);")
+        cur.execute("INSERT INTO t VALUES ('ok');")
+        cur.execute("SELECT v FROM t;")
+        self.assertEqual(cur.fetchone()["v"], "ok")
 
-        # Verify module-level flag exists and can be inspected
-        self.assertIn("_replica_initialized", dir(db_mod))
-        print("  -> Passed Turso sync method and replica guard test!")
+        # Test InMemoryTTLCache
+        cache = db_mod.InMemoryTTLCache(default_ttl=1.0)
+        cache.set("test:1", {"foo": "bar"})
+        self.assertEqual(cache.get("test:1"), {"foo": "bar"})
+
+        # Test prefix invalidation
+        cache.set("test:2", 42)
+        cache.set("other:1", 99)
+        cache.invalidate_prefix("test:")
+        self.assertIsNone(cache.get("test:1"))
+        self.assertIsNone(cache.get("test:2"))
+        self.assertEqual(cache.get("other:1"), 99)
+
+        print("  -> Passed Direct Turso and In-Memory TTL Cache test!")
 
 if __name__ == "__main__":
     unittest.main()

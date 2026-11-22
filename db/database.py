@@ -2,8 +2,9 @@ import os
 import sqlite3
 import json
 import threading
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import date, datetime
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "nihongo.db"
@@ -17,6 +18,55 @@ def get_db_path() -> Path:
             p = Path(__file__).resolve().parent.parent / p
         return p
     return DEFAULT_DB_PATH
+
+# --- In-Memory Thread-Safe TTL Cache ---
+class InMemoryTTLCache:
+    """Thread-safe in-memory cache with TTL expiration and pattern/prefix invalidation."""
+    def __init__(self, default_ttl: float = 60.0):
+        self._default_ttl = default_ttl
+        self._cache: Dict[str, Tuple[float, Any]] = {}
+        self._lock = threading.RLock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            entry = self._cache.get(key)
+            if not entry:
+                return None
+            expiry, val = entry
+            if time.time() > expiry:
+                del self._cache[key]
+                return None
+            return val
+
+    def set(self, key: str, val: Any, ttl: Optional[float] = None):
+        with self._lock:
+            expiry = time.time() + (ttl if ttl is not None else self._default_ttl)
+            self._cache[key] = (expiry, val)
+
+    def invalidate(self, key: str):
+        with self._lock:
+            self._cache.pop(key, None)
+
+    def invalidate_prefix(self, prefix: str):
+        with self._lock:
+            keys_to_del = [k for k in self._cache if k.startswith(prefix)]
+            for k in keys_to_del:
+                del self._cache[k]
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+CACHE = InMemoryTTLCache(default_ttl=60.0)
+
+def invalidate_cache(key: str):
+    CACHE.invalidate(key)
+
+def invalidate_cache_prefix(prefix: str):
+    CACHE.invalidate_prefix(prefix)
+
+def clear_cache():
+    CACHE.clear()
 
 # --- Turso / LibSQL Cloud Support ---
 class TursoRow:
@@ -113,14 +163,6 @@ class TursoConnection:
             return
         self._conn.close()
 
-    def sync(self):
-        """Triggers manual synchronization of the embedded replica with Turso cloud."""
-        if hasattr(self._conn, "sync"):
-            try:
-                return self._conn.sync()
-            except Exception:
-                return None
-
     def __getattr__(self, name):
         return getattr(self._conn, name)
 
@@ -135,13 +177,28 @@ class TursoConnection:
 
 _libsql_singleton = None
 _libsql_lock = threading.RLock()
-_replica_initialized = False
 
 def is_turso_configured() -> bool:
     return bool(os.getenv("TURSO_DATABASE_URL", "").strip())
 
+def _cleanup_stale_replicas():
+    for stale_path in [
+        Path(os.getenv("TURSO_REPLICA_PATH", "db/nihongo_replica.db")),
+        Path("/tmp/nihongo_replica.db")
+    ]:
+        for ext in ["", "-wal", "-shm"]:
+            f = Path(f"{stale_path}{ext}")
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+# Cleanup any stale replica files on startup
+_cleanup_stale_replicas()
+
 def get_connection(db_path: Optional[Path] = None):
-    global _libsql_singleton, _replica_initialized
+    global _libsql_singleton
     turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
     turso_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
     if turso_url and not db_path:
@@ -149,26 +206,10 @@ def get_connection(db_path: Optional[Path] = None):
             if _libsql_singleton is None:
                 try:
                     import libsql_experimental as libsql
-                    replica_path = Path(os.getenv("TURSO_REPLICA_PATH", "db/nihongo_replica.db"))
-                    replica_path.parent.mkdir(parents=True, exist_ok=True)
-                    sync_interval = int(os.getenv("TURSO_SYNC_INTERVAL", "60"))
-
-                    _libsql_singleton = libsql.connect(
-                        str(replica_path),
-                        sync_url=turso_url,
-                        auth_token=turso_token or None,
-                        sync_interval=sync_interval,
-                    )
-
-                    if not _replica_initialized:
-                        try:
-                            _libsql_singleton.sync()
-                            _replica_initialized = True
-                            print(f"✅ [TURSO] Initial embedded replica sync complete from {turso_url}.")
-                        except Exception as sync_err:
-                            print(f"⚠️ [TURSO] Initial replica sync warning: {sync_err}")
+                    _libsql_singleton = libsql.connect(database=turso_url, auth_token=turso_token or None)
+                    print(f"✅ [TURSO] Connected directly to remote Turso cloud at {turso_url}.")
                 except Exception as e:
-                    print(f"⚠️ [TURSO] Failed to connect to Turso replica at {turso_url}: {e}. Falling back to local SQLite.")
+                    print(f"⚠️ [TURSO] Failed to connect directly to Turso: {e}. Falling back to local SQLite.")
 
             if _libsql_singleton is not None:
                 return TursoConnection(_libsql_singleton, is_singleton=True)
@@ -184,18 +225,6 @@ def get_connection(db_path: Optional[Path] = None):
     except Exception:
         pass
     return conn
-
-def sync_turso_replica():
-    """Explicitly triggers a sync of the Turso embedded replica if configured."""
-    if is_turso_configured():
-        conn = get_connection()
-        try:
-            conn.sync()
-            print("🔄 [TURSO] Embedded replica synced successfully.")
-        except Exception as e:
-            print(f"⚠️ [TURSO] Embedded replica sync failed: {e}")
-        finally:
-            conn.close()
 
 def init_database(db_path: Optional[Path] = None):
     """Initializes tables using schema.sql."""
@@ -275,12 +304,22 @@ def save_unit(
             unit_id = row[0] if row else 0
         if close_at_end:
             conn.commit()
+        # Invalidate read cache
+        CACHE.invalidate(f"unit:{unit_number}")
+        CACHE.invalidate_prefix("roadmap:")
+        CACHE.invalidate_prefix("bank:")
+        CACHE.invalidate_prefix("due:")
         return unit_id
     finally:
         if close_at_end:
             conn.close()
 
 def get_unit(unit_number: int) -> Optional[Dict[str, Any]]:
+    cache_key = f"unit:{unit_number}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT * FROM units WHERE unit_number = ?", (unit_number,))
@@ -292,7 +331,10 @@ def get_unit(unit_number: int) -> Optional[Dict[str, Any]]:
             d["lesson_data"] = json.loads(d["lesson_json"])
         except Exception:
             d["lesson_data"] = {}
+        CACHE.set(cache_key, d)
         return d
+    return None
+
 def get_unit_by_notion_page_id(page_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
@@ -350,6 +392,8 @@ def upsert_mastery_item(
             """, (item_type, kana_only, romaji, english, marathi, pronunciation_tip, audio_path, svg_markup, item_id))
             if close_at_end:
                 conn.commit()
+            CACHE.invalidate_prefix("bank:")
+            CACHE.invalidate_prefix("due:")
             return item_id
         else:
             item_id = save_mastery_item(
@@ -372,6 +416,8 @@ def upsert_mastery_item(
             )
             if close_at_end:
                 conn.commit()
+            CACHE.invalidate_prefix("bank:")
+            CACHE.invalidate_prefix("due:")
             return item_id
     finally:
         if close_at_end:
@@ -446,6 +492,8 @@ def batch_upsert_mastery_items(
 
         if close_at_end:
             conn.commit()
+        CACHE.invalidate_prefix("bank:")
+        CACHE.invalidate_prefix("due:")
         return count
     finally:
         if close_at_end:
@@ -464,6 +512,8 @@ def mark_unit_completed(unit_number: int, is_completed: bool = True):
     with conn:
         conn.execute("UPDATE units SET is_completed = ? WHERE unit_number = ?", (int(is_completed), unit_number))
     conn.close()
+    CACHE.invalidate(f"unit:{unit_number}")
+    CACHE.invalidate_prefix("roadmap:")
 
 # --- Mastery Items (SM-2 Bank) ---
 def save_mastery_item(
@@ -505,6 +555,8 @@ def save_mastery_item(
         item_id = cur.lastrowid
         if close_at_end:
             conn.commit()
+        CACHE.invalidate_prefix("bank:")
+        CACHE.invalidate_prefix("due:")
         return item_id
     finally:
         if close_at_end:
@@ -601,20 +653,39 @@ def get_users_count() -> int:
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     if not email:
         return None
+    clean_email = email.strip().lower()
+    cache_key = f"user:email:{clean_email}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email.strip(),))
+    cur.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (clean_email,))
     row = cur.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if row:
+        res = dict(row)
+        CACHE.set(cache_key, res)
+        return res
+    return None
 
 def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    cache_key = f"user:id:{user_id}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if row:
+        res = dict(row)
+        CACHE.set(cache_key, res)
+        return res
+    return None
 
 def create_user(
     email: str,
@@ -633,6 +704,7 @@ def create_user(
         """, (email.strip().lower(), name.strip(), password_hash, auth_provider, role, avatar_url))
         user_id = cur.lastrowid
     conn.close()
+    CACHE.invalidate_prefix("user:")
     return get_user_by_id(user_id)
 
 def upsert_google_user(email: str, name: str, avatar_url: Optional[str] = None, default_role: str = 'student') -> Dict[str, Any]:
@@ -646,6 +718,7 @@ def upsert_google_user(email: str, name: str, avatar_url: Optional[str] = None, 
                 WHERE id = ?
             """, (name, avatar_url, default_role, existing["id"]))
         conn.close()
+        CACHE.invalidate_prefix("user:")
         return get_user_by_id(existing["id"])
     return create_user(
         email=email,
@@ -664,9 +737,15 @@ def update_user_stats(user_id: int, xp_delta: int = 0, streak: Optional[int] = N
         else:
             conn.execute("UPDATE users SET xp = MAX(0, xp + ?), streak = MAX(COALESCE(streak, 0), 1) WHERE id = ?", (xp_delta, user_id))
     conn.close()
+    CACHE.invalidate(f"user:id:{user_id}")
 
 # --- Per-User Unit Progression ---
 def get_user_roadmap(user_id: int) -> List[Dict[str, Any]]:
+    cache_key = f"roadmap:{user_id}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -679,7 +758,9 @@ def get_user_roadmap(user_id: int) -> List[Dict[str, Any]]:
     """, (user_id,))
     rows = cur.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    res = [dict(r) for r in rows]
+    CACHE.set(cache_key, res)
+    return res
 
 def mark_user_unit_completed(user_id: int, unit_number: int, is_completed: bool = True, accuracy: float = 1.0):
     conn = get_connection()
@@ -693,6 +774,7 @@ def mark_user_unit_completed(user_id: int, unit_number: int, is_completed: bool 
                 completed_at = CURRENT_TIMESTAMP
         """, (user_id, unit_number, int(is_completed), float(accuracy)))
     conn.close()
+    CACHE.invalidate(f"roadmap:{user_id}")
 
 # --- Per-User SM-2 Mastery ---
 def get_user_mastery_item(user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
@@ -727,8 +809,15 @@ def save_user_mastery(
                 next_review_date = excluded.next_review_date
         """, (user_id, item_id, ease_factor, interval_days, repetitions, wrong_count, rev_date))
     conn.close()
+    CACHE.invalidate(f"bank:{user_id}")
+    CACHE.invalidate_prefix(f"due:{user_id}")
 
 def get_user_due_mastery_items(user_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+    cache_key = f"due:{user_id}:{limit}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -747,9 +836,16 @@ def get_user_due_mastery_items(user_id: int, limit: int = 30) -> List[Dict[str, 
     """, (user_id, limit))
     rows = cur.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    res = [dict(r) for r in rows]
+    CACHE.set(cache_key, res)
+    return res
 
 def get_user_bank_items(user_id: int) -> List[Dict[str, Any]]:
+    cache_key = f"bank:{user_id}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -766,7 +862,9 @@ def get_user_bank_items(user_id: int) -> List[Dict[str, Any]]:
     """, (user_id,))
     rows = cur.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    res = [dict(r) for r in rows]
+    CACHE.set(cache_key, res)
+    return res
 
 # --- Live Sensei Practice Sessions & AI Recaps ---
 def save_live_session(

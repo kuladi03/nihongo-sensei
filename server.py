@@ -65,6 +65,9 @@ from db.database import (
     get_all_notion_page_sync_states,
     upsert_notion_page_sync_state,
     is_turso_configured,
+    invalidate_cache,
+    invalidate_cache_prefix,
+    clear_cache,
 )
 from live_sensei import handle_live_session
 
@@ -286,6 +289,100 @@ def require_admin(request: Request) -> dict:
 # -------------------- Audio Endpoint with On-Demand Lazy TTS --------------------
 _audio_synthesis_locks: Dict[str, asyncio.Lock] = {}
 _audio_synthesis_meta_lock = asyncio.Lock()
+_audio_phrase_index: Dict[str, str] = {}
+_audio_index_lock = threading.RLock()
+_audio_index_loaded = False
+
+def build_audio_phrase_index():
+    """Builds an exhaustive mapping from audio filenames/hashes to Japanese phrases across mastery_items, kaggle_audio, and units JSON (study_cards + exercises)."""
+    global _audio_phrase_index, _audio_index_loaded
+    index: Dict[str, str] = {}
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # 1. From mastery_items
+        cur.execute("SELECT japanese, kana_only, audio_path FROM mastery_items")
+        for row in cur.fetchall():
+            phrase = (row["kana_only"] or row["japanese"] or "").strip()
+            if phrase:
+                h = hashlib.md5(phrase.encode("utf-8")).hexdigest()
+                index[f"{h}.mp3"] = phrase
+            audio_p = row["audio_path"]
+            if audio_p and phrase:
+                fname = Path(audio_p).name
+                if fname:
+                    index[fname] = phrase
+
+        # 2. From kaggle_audio
+        cur.execute("SELECT transcript, file_path FROM kaggle_audio")
+        for row in cur.fetchall():
+            tr = (row["transcript"] or "").strip()
+            fp = row["file_path"]
+            if tr:
+                h = hashlib.md5(tr.encode("utf-8")).hexdigest()
+                index[f"{h}.mp3"] = tr
+                if fp:
+                    fname = Path(fp).name
+                    if fname:
+                        index[fname] = tr
+
+        # 3. From units (lesson_json: study_cards + exercises)
+        cur.execute("SELECT lesson_json FROM units")
+        for row in cur.fetchall():
+            lj = row["lesson_json"]
+            if not lj:
+                continue
+            try:
+                data = json.loads(lj)
+            except Exception:
+                continue
+
+            def index_text_candidate(text: Any, explicit_audio_path: Optional[str] = None):
+                if not isinstance(text, str):
+                    return
+                clean = text.strip()
+                if not clean:
+                    return
+
+                # Direct hash mapping
+                h = hashlib.md5(clean.encode("utf-8")).hexdigest()
+                index[f"{h}.mp3"] = clean
+
+                # Cleaned Japanese punctuation mapping
+                clean_no_punct = clean.rstrip("。！？.!? ")
+                if clean_no_punct and clean_no_punct != clean:
+                    h2 = hashlib.md5(clean_no_punct.encode("utf-8")).hexdigest()
+                    index[f"{h2}.mp3"] = clean_no_punct
+
+                if explicit_audio_path:
+                    fname = Path(explicit_audio_path).name
+                    if fname:
+                        index[fname] = clean
+
+            for card in data.get("study_cards", []):
+                card_audio = card.get("audio_path")
+                index_text_candidate(card.get("kana_only"), card_audio)
+                index_text_candidate(card.get("japanese"), card_audio)
+
+            for ex in data.get("exercises", []):
+                ex_audio = ex.get("audio_path")
+                index_text_candidate(ex.get("target_kana"), ex_audio)
+                index_text_candidate(ex.get("target_phrase"), ex_audio)
+                index_text_candidate(ex.get("target"), ex_audio)
+                index_text_candidate(ex.get("correct_answer"), ex_audio)
+                index_text_candidate(ex.get("prompt"), ex_audio)
+                index_text_candidate(ex.get("question"), ex_audio)
+                for opt in ex.get("options", []):
+                    index_text_candidate(opt)
+
+        conn.close()
+        with _audio_index_lock:
+            _audio_phrase_index = index
+            _audio_index_loaded = True
+        logger.info("🎙️ [AUDIO_INDEX] Exhaustively indexed %d phrases for on-demand Lazy TTS.", len(index))
+    except Exception as e:
+        logger.warning("⚠️ [AUDIO_INDEX] Failed to build audio phrase index: %s", e)
 
 async def get_audio_file_lock(filename: str) -> asyncio.Lock:
     async with _audio_synthesis_meta_lock:
@@ -305,32 +402,21 @@ async def serve_audio_file(filename: str):
         if file_path.exists() and file_path.is_file() and file_path.stat().st_size > 0:
             return FileResponse(file_path, media_type="audio/mpeg")
 
-        # On-demand lazy synthesis: look up the Japanese phrase for this audio file
-        conn = get_connection()
-        cur = conn.cursor()
-        phrase = ""
-
-        # 1. Search mastery_items table
-        cur.execute("SELECT japanese, kana_only FROM mastery_items WHERE audio_path LIKE ? LIMIT 1", (f"%{filename}",))
-        row = cur.fetchone()
-        if row:
-            phrase = row["kana_only"] or row["japanese"]
-        else:
-            # 2. Search kaggle_audio table
-            cur.execute("SELECT transcript FROM kaggle_audio WHERE file_path LIKE ? LIMIT 1", (f"%{filename}",))
-            krow = cur.fetchone()
-            if krow:
-                phrase = krow["transcript"]
-            else:
-                # 3. Check hash match against mastery items
+        # Exhaustive on-demand lazy lookup
+        with _audio_index_lock:
+            phrase = _audio_phrase_index.get(filename)
+            if not phrase:
                 name_no_ext = filename.replace(".mp3", "")
-                cur.execute("SELECT japanese, kana_only FROM mastery_items")
-                for m in cur.fetchall():
-                    t = (m["kana_only"] or m["japanese"]).strip()
-                    if hashlib.md5(t.encode("utf-8")).hexdigest() == name_no_ext:
-                        phrase = t
-                        break
-        conn.close()
+                phrase = _audio_phrase_index.get(f"{name_no_ext}.mp3")
+
+        # If not indexed yet, build or refresh index from DB once
+        if not phrase:
+            build_audio_phrase_index()
+            with _audio_index_lock:
+                phrase = _audio_phrase_index.get(filename)
+                if not phrase:
+                    name_no_ext = filename.replace(".mp3", "")
+                    phrase = _audio_phrase_index.get(f"{name_no_ext}.mp3")
 
         if phrase:
             logger.info("🎙️ [LAZY_TTS] Generating on-demand audio for '%s' -> %s", phrase, filename)
@@ -778,10 +864,16 @@ async def sync_notion(request: Request):
         sync_result = await asyncio.to_thread(_sync_notion_task, token, page_id)
         SYNC_STATUS["last_synced_at"] = sync_result["now_iso"]
         SYNC_STATUS["last_checked_at"] = sync_result["now_iso"]
+        invalidate_cache_prefix("unit:")
+        invalidate_cache_prefix("roadmap:")
+        invalidate_cache_prefix("bank:")
+        invalidate_cache_prefix("due:")
+        build_audio_phrase_index()
         return sync_result["resp"]
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("❌ [SYNC_NOTION] Failed to sync Notion: %s", e)
         SYNC_STATUS["last_error"] = str(e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -806,12 +898,18 @@ async def build_units(request: Request):
         force = bool(body.get("force", False))
         from build_curriculum import build_all_units
         units = await asyncio.to_thread(build_all_units, force=force)
+        invalidate_cache_prefix("unit:")
+        invalidate_cache_prefix("roadmap:")
+        invalidate_cache_prefix("bank:")
+        invalidate_cache_prefix("due:")
+        build_audio_phrase_index()
         return {
             "success": True,
             "built_units_count": len(units),
             "units": [{"unit_number": u.get("unit_number"), "title": u.get("unit_title")} for u in units]
         }
     except Exception as e:
+        logger.exception("❌ [BUILD_UNITS] Failed to build units: %s", e)
         SYNC_STATUS["last_error"] = str(e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -902,6 +1000,12 @@ async def submit_progress(request: Request):
         new_xp = fresh_user["xp"] if fresh_user else user.get("xp", 0)
         curr_streak = fresh_user["streak"] if fresh_user else user.get("streak", 0)
 
+        # Invalidate read cache for user
+        invalidate_cache(f"roadmap:{user['id']}")
+        invalidate_cache(f"bank:{user['id']}")
+        invalidate_cache_prefix(f"due:{user['id']}")
+        invalidate_cache(f"user:id:{user['id']}")
+
         return {
             "status": "ok",
             "earned_xp": earned_xp,
@@ -916,6 +1020,7 @@ async def submit_progress(request: Request):
             "boss_unit_unlocked": boss_unit is not None,
         }
     except Exception as e:
+        logger.exception("❌ [PROGRESS_SUBMIT] Failed to submit progress: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/review/grade")
@@ -949,6 +1054,13 @@ async def grade_review_item(request: Request):
             next_review_date=next_date
         )
         update_user_stats(user["id"], xp_delta=10)
+
+        # Invalidate read cache for review grading
+        invalidate_cache(f"bank:{user['id']}")
+        invalidate_cache_prefix(f"due:{user['id']}")
+        invalidate_cache(f"roadmap:{user['id']}")
+        invalidate_cache(f"user:id:{user['id']}")
+
         return {
             "success": True,
             "item_id": item_id,
@@ -957,7 +1069,14 @@ async def grade_review_item(request: Request):
             "next_review_date": next_date
         }
     except Exception as e:
+        logger.exception("❌ [REVIEW_GRADE] Failed to grade review item: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+# Initial build of audio phrase index on startup
+try:
+    build_audio_phrase_index()
+except Exception as e:
+    logger.warning("⚠️ Could not build audio phrase index on initial startup: %s", e)
 
 # -------------------- Frontend Static Assets & SPA Fallback --------------------
 assets_dir = FRONTEND_DIST / "assets"
