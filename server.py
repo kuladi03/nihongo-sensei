@@ -284,44 +284,62 @@ def require_admin(request: Request) -> dict:
     return user
 
 # -------------------- Audio Endpoint with On-Demand Lazy TTS --------------------
+_audio_synthesis_locks: Dict[str, asyncio.Lock] = {}
+_audio_synthesis_meta_lock = asyncio.Lock()
+
+async def get_audio_file_lock(filename: str) -> asyncio.Lock:
+    async with _audio_synthesis_meta_lock:
+        if filename not in _audio_synthesis_locks:
+            _audio_synthesis_locks[filename] = asyncio.Lock()
+        return _audio_synthesis_locks[filename]
+
 @app.get("/static/audio/{filename}")
 async def serve_audio_file(filename: str):
     file_path = STATIC_AUDIO_DIR / filename
     if file_path.exists() and file_path.is_file() and file_path.stat().st_size > 0:
         return FileResponse(file_path, media_type="audio/mpeg")
 
-    # On-demand lazy synthesis: look up the Japanese phrase for this audio file
-    conn = get_connection()
-    cur = conn.cursor()
-    phrase = ""
-
-    # 1. Search mastery_items table
-    cur.execute("SELECT japanese, kana_only FROM mastery_items WHERE audio_path LIKE ? LIMIT 1", (f"%{filename}",))
-    row = cur.fetchone()
-    if row:
-        phrase = row["kana_only"] or row["japanese"]
-    else:
-        # 2. Search kaggle_audio table
-        cur.execute("SELECT transcript FROM kaggle_audio WHERE file_path LIKE ? LIMIT 1", (f"%{filename}",))
-        krow = cur.fetchone()
-        if krow:
-            phrase = krow["transcript"]
-        else:
-            # 3. Check hash match against mastery items
-            name_no_ext = filename.replace(".mp3", "")
-            cur.execute("SELECT japanese, kana_only FROM mastery_items")
-            for m in cur.fetchall():
-                t = (m["kana_only"] or m["japanese"]).strip()
-                if hashlib.md5(t.encode("utf-8")).hexdigest() == name_no_ext:
-                    phrase = t
-                    break
-    conn.close()
-
-    if phrase:
-        logger.info("🎙️ [LAZY_TTS] Generating on-demand audio for '%s' -> %s", phrase, filename)
-        success = await synthesize_lazy_audio(phrase, file_path)
-        if success:
+    lock = await get_audio_file_lock(filename)
+    async with lock:
+        # Re-check existence inside lock to avoid duplicate synthesis
+        if file_path.exists() and file_path.is_file() and file_path.stat().st_size > 0:
             return FileResponse(file_path, media_type="audio/mpeg")
+
+        # On-demand lazy synthesis: look up the Japanese phrase for this audio file
+        conn = get_connection()
+        cur = conn.cursor()
+        phrase = ""
+
+        # 1. Search mastery_items table
+        cur.execute("SELECT japanese, kana_only FROM mastery_items WHERE audio_path LIKE ? LIMIT 1", (f"%{filename}",))
+        row = cur.fetchone()
+        if row:
+            phrase = row["kana_only"] or row["japanese"]
+        else:
+            # 2. Search kaggle_audio table
+            cur.execute("SELECT transcript FROM kaggle_audio WHERE file_path LIKE ? LIMIT 1", (f"%{filename}",))
+            krow = cur.fetchone()
+            if krow:
+                phrase = krow["transcript"]
+            else:
+                # 3. Check hash match against mastery items
+                name_no_ext = filename.replace(".mp3", "")
+                cur.execute("SELECT japanese, kana_only FROM mastery_items")
+                for m in cur.fetchall():
+                    t = (m["kana_only"] or m["japanese"]).strip()
+                    if hashlib.md5(t.encode("utf-8")).hexdigest() == name_no_ext:
+                        phrase = t
+                        break
+        conn.close()
+
+        if phrase:
+            logger.info("🎙️ [LAZY_TTS] Generating on-demand audio for '%s' -> %s", phrase, filename)
+            try:
+                success = await asyncio.wait_for(synthesize_lazy_audio(phrase, file_path), timeout=10.0)
+                if success and file_path.exists() and file_path.stat().st_size > 0:
+                    return FileResponse(file_path, media_type="audio/mpeg")
+            except asyncio.TimeoutError:
+                logger.error("❌ [LAZY_TTS] Timeout generating audio for '%s'", phrase)
 
     return JSONResponse(status_code=404, content={"error": "Audio file not found", "file": filename})
 
@@ -696,6 +714,44 @@ async def get_due_review(request: Request, limit: int = 30):
     }
 
 # -------------------- Admin Notion & Curriculum Sync --------------------
+def _sync_notion_task(token: str, page_id: str) -> dict:
+    agent = NotionSyncAgent(token)
+    children = agent.get_child_pages(page_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if children:
+        result = agent.sync_hub(page_id)
+        for child in children:
+            meta = agent.get_page_metadata(child["page_id"])
+            if meta.get("last_edited_time"):
+                upsert_notion_page_sync_state(child["page_id"], meta["last_edited_time"])
+        return {
+            "resp": {
+                "success": True,
+                "type": "hub",
+                "hub_title": result["hub_title"],
+                "total_classes": result["total_classes"],
+                "classes": result["classes"],
+            },
+            "now_iso": now_iso,
+        }
+    else:
+        result = agent.sync_to_db(page_id)
+        meta = agent.get_page_metadata(page_id)
+        if meta.get("last_edited_time"):
+            upsert_notion_page_sync_state(page_id, meta["last_edited_time"])
+        return {
+            "resp": {
+                "success": True,
+                "type": "page",
+                "page_id": result["page_id"],
+                "title": result["title"],
+                "content_hash": result["content_hash"],
+                "notes_length": result["notes_length"],
+                "preview": result["markdown"][:500],
+            },
+            "now_iso": now_iso,
+        }
+
 @app.post("/api/sync/notion")
 async def sync_notion(request: Request):
     user = require_admin(request)
@@ -719,40 +775,10 @@ async def sync_notion(request: Request):
         if not page_id:
             raise HTTPException(status_code=400, detail="NOTION_PAGE_ID is missing.")
 
-        agent = NotionSyncAgent(token)
-        children = agent.get_child_pages(page_id)
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if children:
-            result = agent.sync_hub(page_id)
-            for child in children:
-                meta = agent.get_page_metadata(child["page_id"])
-                if meta.get("last_edited_time"):
-                    upsert_notion_page_sync_state(child["page_id"], meta["last_edited_time"])
-            SYNC_STATUS["last_synced_at"] = now_iso
-            SYNC_STATUS["last_checked_at"] = now_iso
-            return {
-                "success": True,
-                "type": "hub",
-                "hub_title": result["hub_title"],
-                "total_classes": result["total_classes"],
-                "classes": result["classes"],
-            }
-        else:
-            result = agent.sync_to_db(page_id)
-            meta = agent.get_page_metadata(page_id)
-            if meta.get("last_edited_time"):
-                upsert_notion_page_sync_state(page_id, meta["last_edited_time"])
-            SYNC_STATUS["last_synced_at"] = now_iso
-            SYNC_STATUS["last_checked_at"] = now_iso
-            return {
-                "success": True,
-                "type": "page",
-                "page_id": result["page_id"],
-                "title": result["title"],
-                "content_hash": result["content_hash"],
-                "notes_length": result["notes_length"],
-                "preview": result["markdown"][:500],
-            }
+        sync_result = await asyncio.to_thread(_sync_notion_task, token, page_id)
+        SYNC_STATUS["last_synced_at"] = sync_result["now_iso"]
+        SYNC_STATUS["last_checked_at"] = sync_result["now_iso"]
+        return sync_result["resp"]
     except HTTPException:
         raise
     except Exception as e:
@@ -779,7 +805,7 @@ async def build_units(request: Request):
         body = await request.json() if (await request.body()) else {}
         force = bool(body.get("force", False))
         from build_curriculum import build_all_units
-        units = build_all_units(force=force)
+        units = await asyncio.to_thread(build_all_units, force=force)
         return {
             "success": True,
             "built_units_count": len(units),

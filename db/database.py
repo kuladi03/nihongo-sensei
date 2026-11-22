@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import json
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import date, datetime
@@ -84,8 +85,9 @@ class TursoCursor:
 
 class TursoConnection:
     """Connection wrapper for libsql managing transactions and returning TursoCursor."""
-    def __init__(self, conn):
+    def __init__(self, conn, is_singleton: bool = False):
         self._conn = conn
+        self.is_singleton = is_singleton
         self.row_factory = None
 
     def cursor(self) -> TursoCursor:
@@ -107,6 +109,8 @@ class TursoConnection:
         self._conn.rollback()
 
     def close(self):
+        if self.is_singleton:
+            return
         self._conn.close()
 
     def sync(self):
@@ -129,46 +133,56 @@ class TursoConnection:
         else:
             self.rollback()
 
+_libsql_singleton = None
+_libsql_lock = threading.RLock()
 _replica_initialized = False
 
 def is_turso_configured() -> bool:
     return bool(os.getenv("TURSO_DATABASE_URL", "").strip())
 
 def get_connection(db_path: Optional[Path] = None):
-    global _replica_initialized
+    global _libsql_singleton, _replica_initialized
     turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
     turso_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
     if turso_url and not db_path:
-        try:
-            import libsql_experimental as libsql
-            replica_path = Path(os.getenv("TURSO_REPLICA_PATH", "db/nihongo_replica.db"))
-            replica_path.parent.mkdir(parents=True, exist_ok=True)
-            sync_interval = int(os.getenv("TURSO_SYNC_INTERVAL", "60"))
-
-            raw_conn = libsql.connect(
-                str(replica_path),
-                sync_url=turso_url,
-                auth_token=turso_token or None,
-                sync_interval=sync_interval,
-            )
-
-            if not _replica_initialized:
+        with _libsql_lock:
+            if _libsql_singleton is None:
                 try:
-                    raw_conn.sync()
-                    _replica_initialized = True
-                    print(f"✅ [TURSO] Initial embedded replica sync complete from {turso_url}.")
-                except Exception as sync_err:
-                    print(f"⚠️ [TURSO] Initial replica sync warning: {sync_err}")
+                    import libsql_experimental as libsql
+                    replica_path = Path(os.getenv("TURSO_REPLICA_PATH", "db/nihongo_replica.db"))
+                    replica_path.parent.mkdir(parents=True, exist_ok=True)
+                    sync_interval = int(os.getenv("TURSO_SYNC_INTERVAL", "60"))
 
-            return TursoConnection(raw_conn)
-        except Exception as e:
-            print(f"⚠️ [TURSO] Failed to connect to Turso replica at {turso_url}: {e}. Falling back to local SQLite.")
+                    _libsql_singleton = libsql.connect(
+                        str(replica_path),
+                        sync_url=turso_url,
+                        auth_token=turso_token or None,
+                        sync_interval=sync_interval,
+                    )
+
+                    if not _replica_initialized:
+                        try:
+                            _libsql_singleton.sync()
+                            _replica_initialized = True
+                            print(f"✅ [TURSO] Initial embedded replica sync complete from {turso_url}.")
+                        except Exception as sync_err:
+                            print(f"⚠️ [TURSO] Initial replica sync warning: {sync_err}")
+                except Exception as e:
+                    print(f"⚠️ [TURSO] Failed to connect to Turso replica at {turso_url}: {e}. Falling back to local SQLite.")
+
+            if _libsql_singleton is not None:
+                return TursoConnection(_libsql_singleton, is_singleton=True)
 
     target = db_path or get_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target)
+    conn = sqlite3.connect(target, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+    except Exception:
+        pass
     return conn
 
 def sync_turso_replica():
@@ -234,10 +248,14 @@ def save_unit(
     unit_type: str = "DAILY",
     notion_page_id: Optional[str] = None,
     content_hash: Optional[str] = None,
-    is_completed: bool = False
+    is_completed: bool = False,
+    conn: Optional[Any] = None
 ) -> int:
-    conn = get_connection()
-    with conn:
+    close_at_end = False
+    if conn is None:
+        conn = get_connection()
+        close_at_end = True
+    try:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO units (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, is_completed, created_at)
@@ -253,9 +271,14 @@ def save_unit(
         unit_id = cur.lastrowid
         if not unit_id or unit_id == 0:
             cur.execute("SELECT id FROM units WHERE unit_number = ?", (unit_number,))
-            unit_id = cur.fetchone()[0]
-    conn.close()
-    return unit_id
+            row = cur.fetchone()
+            unit_id = row[0] if row else 0
+        if close_at_end:
+            conn.commit()
+        return unit_id
+    finally:
+        if close_at_end:
+            conn.close()
 
 def get_unit(unit_number: int) -> Optional[Dict[str, Any]]:
     conn = get_connection()
@@ -300,16 +323,20 @@ def upsert_mastery_item(
     interval_days: int = 1,
     repetitions: int = 0,
     wrong_count: int = 0,
-    next_review_date: Optional[str] = None
+    next_review_date: Optional[str] = None,
+    conn: Optional[Any] = None
 ) -> int:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM mastery_items WHERE unit_id = ? AND japanese = ?", (unit_id, japanese))
-    row = cur.fetchone()
-    if row:
-        item_id = row["id"]
-        with conn:
-            conn.execute("""
+    close_at_end = False
+    if conn is None:
+        conn = get_connection()
+        close_at_end = True
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM mastery_items WHERE unit_id = ? AND japanese = ?", (unit_id, japanese))
+        row = cur.fetchone()
+        if row:
+            item_id = row["id"]
+            cur.execute("""
                 UPDATE mastery_items SET
                     item_type = ?,
                     kana_only = COALESCE(?, kana_only),
@@ -321,27 +348,108 @@ def upsert_mastery_item(
                     svg_markup = COALESCE(?, svg_markup)
                 WHERE id = ?
             """, (item_type, kana_only, romaji, english, marathi, pronunciation_tip, audio_path, svg_markup, item_id))
-        conn.close()
-        return item_id
-    else:
-        conn.close()
-        return save_mastery_item(
-            unit_id=unit_id,
-            item_type=item_type,
-            japanese=japanese,
-            kana_only=kana_only,
-            romaji=romaji,
-            english=english,
-            marathi=marathi,
-            pronunciation_tip=pronunciation_tip,
-            audio_path=audio_path,
-            svg_markup=svg_markup,
-            ease_factor=ease_factor,
-            interval_days=interval_days,
-            repetitions=repetitions,
-            wrong_count=wrong_count,
-            next_review_date=next_review_date
-        )
+            if close_at_end:
+                conn.commit()
+            return item_id
+        else:
+            item_id = save_mastery_item(
+                unit_id=unit_id,
+                item_type=item_type,
+                japanese=japanese,
+                kana_only=kana_only,
+                romaji=romaji,
+                english=english,
+                marathi=marathi,
+                pronunciation_tip=pronunciation_tip,
+                audio_path=audio_path,
+                svg_markup=svg_markup,
+                ease_factor=ease_factor,
+                interval_days=interval_days,
+                repetitions=repetitions,
+                wrong_count=wrong_count,
+                next_review_date=next_review_date,
+                conn=conn
+            )
+            if close_at_end:
+                conn.commit()
+            return item_id
+    finally:
+        if close_at_end:
+            conn.close()
+
+def batch_upsert_mastery_items(
+    unit_id: int,
+    cards: List[Dict[str, Any]],
+    conn: Optional[Any] = None
+) -> int:
+    """Batch upserts study cards for a unit within a single connection/transaction."""
+    if not cards:
+        return 0
+
+    close_at_end = False
+    if conn is None:
+        conn = get_connection()
+        close_at_end = True
+
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, japanese FROM mastery_items WHERE unit_id = ?", (unit_id,))
+        existing_map = {}
+        for r in cur.fetchall():
+            existing_map[r["japanese"]] = r["id"]
+
+        today_str = date.today().isoformat()
+        count = 0
+        for card in cards:
+            japanese = card.get("japanese")
+            if not japanese:
+                continue
+
+            item_type = card.get("item_type", "VOCAB")
+            kana_only = card.get("kana_only")
+            romaji = card.get("romaji")
+            english = card.get("english")
+            marathi = card.get("marathi")
+            pronunciation_tip = card.get("pronunciation_tip")
+            audio_path = card.get("audio_path")
+            svg_markup = card.get("svg_markup")
+
+            if japanese in existing_map:
+                item_id = existing_map[japanese]
+                cur.execute("""
+                    UPDATE mastery_items SET
+                        item_type = ?,
+                        kana_only = COALESCE(?, kana_only),
+                        romaji = COALESCE(?, romaji),
+                        english = COALESCE(?, english),
+                        marathi = COALESCE(?, marathi),
+                        pronunciation_tip = COALESCE(?, pronunciation_tip),
+                        audio_path = COALESCE(?, audio_path),
+                        svg_markup = COALESCE(?, svg_markup)
+                    WHERE id = ?
+                """, (item_type, kana_only, romaji, english, marathi, pronunciation_tip, audio_path, svg_markup, item_id))
+            else:
+                cur.execute("""
+                    INSERT INTO mastery_items (
+                        unit_id, item_type, japanese, kana_only, romaji, english, marathi,
+                        pronunciation_tip, audio_path, svg_markup, ease_factor, interval_days,
+                        repetitions, wrong_count, next_review_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2.5, 1, 0, 0, ?)
+                """, (
+                    unit_id, item_type, japanese, kana_only, romaji, english, marathi,
+                    pronunciation_tip, audio_path, svg_markup, today_str
+                ))
+                new_id = cur.lastrowid
+                if new_id:
+                    existing_map[japanese] = new_id
+            count += 1
+
+        if close_at_end:
+            conn.commit()
+        return count
+    finally:
+        if close_at_end:
+            conn.close()
 
 def get_all_units() -> List[Dict[str, Any]]:
     conn = get_connection()
@@ -373,11 +481,15 @@ def save_mastery_item(
     interval_days: int = 1,
     repetitions: int = 0,
     wrong_count: int = 0,
-    next_review_date: Optional[str] = None
+    next_review_date: Optional[str] = None,
+    conn: Optional[Any] = None
 ) -> int:
-    conn = get_connection()
+    close_at_end = False
+    if conn is None:
+        conn = get_connection()
+        close_at_end = True
     rev_date = next_review_date or date.today().isoformat()
-    with conn:
+    try:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO mastery_items (
@@ -391,8 +503,12 @@ def save_mastery_item(
             repetitions, wrong_count, rev_date
         ))
         item_id = cur.lastrowid
-    conn.close()
-    return item_id
+        if close_at_end:
+            conn.commit()
+        return item_id
+    finally:
+        if close_at_end:
+            conn.close()
 
 def get_due_mastery_items(limit: int = 6) -> List[Dict[str, Any]]:
     """Fetches up to `limit` items that are due for review or have previous mistakes."""

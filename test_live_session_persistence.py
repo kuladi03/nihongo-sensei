@@ -31,7 +31,7 @@ async def test_persistence():
     count_before = len(sessions_before)
     print(f"  -> Found {count_before} existing sessions.")
 
-    ws_url = f"ws://127.0.0.1:8001/?token={token}"
+    ws_url = f"ws://127.0.0.1:8000/api/live/session?token={token}"
     print(f"\n[TEST] 2. Connecting to Live Sensei at {ws_url}...")
 
     async with websockets.connect(ws_url) as ws:

@@ -24,6 +24,7 @@ from db.database import (
     get_unit_by_notion_page_id,
     save_mastery_item,
     upsert_mastery_item,
+    batch_upsert_mastery_items,
     get_due_mastery_items,
     get_all_units,
     get_connection,
@@ -66,19 +67,12 @@ def build_all_units(force: bool = False) -> List[Dict[str, Any]]:
             # Ensure all cards in existing lesson_data are registered in mastery_items
             unit_id = existing_unit["id"]
             existing_cards = existing_unit.get("lesson_data", {}).get("study_cards", [])
-            for card in existing_cards:
-                upsert_mastery_item(
-                    unit_id=unit_id,
-                    item_type=card.get("item_type", "VOCAB"),
-                    japanese=card.get("japanese"),
-                    kana_only=card.get("kana_only"),
-                    romaji=card.get("romaji"),
-                    english=card.get("english"),
-                    marathi=card.get("marathi"),
-                    pronunciation_tip=card.get("pronunciation_tip"),
-                    audio_path=card.get("audio_path"),
-                    svg_markup=card.get("svg_markup"),
-                )
+            conn = get_connection()
+            try:
+                with conn:
+                    saved_cards = batch_upsert_mastery_items(unit_id=unit_id, cards=existing_cards, conn=conn)
+            finally:
+                conn.close()
             built_units.append(existing_unit["lesson_data"])
             continue
 
@@ -109,34 +103,26 @@ def build_all_units(force: bool = False) -> List[Dict[str, Any]]:
         # 2. Enrich Audio and SVGs via Agent 3
         enriched_dict = media_agent.enrich_unit(unit_dict)
 
-        # 3. Save Unit into SQLite in place
-        unit_id = save_unit(
-            unit_number=unit_num,
-            title=enriched_dict["unit_title"],
-            lesson_json=json.dumps(enriched_dict, ensure_ascii=False),
-            unit_type="DAILY",
-            notion_page_id=c["page_id"],
-            content_hash=c["content_hash"],
-            is_completed=bool(existing_unit.get("is_completed", 0)) if existing_unit else False,
-        )
+        # 3. Save Unit into SQLite in a single transaction
+        conn = get_connection()
+        try:
+            with conn:
+                unit_id = save_unit(
+                    unit_number=unit_num,
+                    title=enriched_dict["unit_title"],
+                    lesson_json=json.dumps(enriched_dict, ensure_ascii=False),
+                    unit_type="DAILY",
+                    notion_page_id=c["page_id"],
+                    content_hash=c["content_hash"],
+                    is_completed=bool(existing_unit.get("is_completed", 0)) if existing_unit else False,
+                    conn=conn,
+                )
 
-        # 4. Ingest/Upsert StudyCards into mastery_items (SM-2 Bank) without wiping history
-        cards = enriched_dict.get("study_cards", [])
-        saved_cards = 0
-        for card in cards:
-            upsert_mastery_item(
-                unit_id=unit_id,
-                item_type=card.get("item_type", "VOCAB"),
-                japanese=card.get("japanese"),
-                kana_only=card.get("kana_only"),
-                romaji=card.get("romaji"),
-                english=card.get("english"),
-                marathi=card.get("marathi"),
-                pronunciation_tip=card.get("pronunciation_tip"),
-                audio_path=card.get("audio_path"),
-                svg_markup=card.get("svg_markup"),
-            )
-            saved_cards += 1
+                # 4. Ingest/Upsert StudyCards into mastery_items (SM-2 Bank) in batch
+                cards = enriched_dict.get("study_cards", [])
+                saved_cards = batch_upsert_mastery_items(unit_id=unit_id, cards=cards, conn=conn)
+        finally:
+            conn.close()
 
         print(f"💾 Unit {unit_num:02d} saved to SQLite in place (ID: {unit_id}, {saved_cards} mastery cards upserted).")
         built_units.append(enriched_dict)
