@@ -103,7 +103,7 @@ class TursoCursor:
 
     def execute(self, sql: str, params=()):
         if params:
-            self._cur.execute(sql, params)
+            self._cur.execute(sql, tuple(params))
         else:
             self._cur.execute(sql)
         return self
