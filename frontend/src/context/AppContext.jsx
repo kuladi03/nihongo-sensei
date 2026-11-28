@@ -250,12 +250,22 @@ export function AppProvider({ children }) {
   }, [bankItems]);
 
   const learnedKanaCount = useMemo(() => {
-    // Hiragana range: [\u3040-\u309F]
-    return (bankItems || []).filter(item => {
-      if ((item.item_type || '').toUpperCase() !== 'KANA') return false;
-      const text = (item.kana_only || item.japanese || '').trim();
-      return /[\u3040-\u309F]/.test(text);
-    }).length;
+    const uniqueKana = new Set();
+    const SMALL_KANA = new Set(['ぁ','ぃ','ぅ','ぇ','ぉ','っ','ゃ','ゅ','ょ','ゎ']);
+
+    (bankItems || []).forEach(item => {
+      if ((item.item_type || '').toUpperCase() !== 'KANA') return;
+      const text = (item.japanese || item.kana_only || '').trim();
+      // Strictly filter to single Hiragana character OR valid 2-char yōon combination
+      const isSingleKana = text.length === 1 && /^[\u3040-\u309F]$/.test(text);
+      const isYoonKana = text.length === 2 && /^[\u3040-\u309F]$/.test(text[0]) && SMALL_KANA.has(text[1]);
+
+      if (isSingleKana || isYoonKana) {
+        uniqueKana.add(text);
+      }
+    });
+
+    return uniqueKana.size;
   }, [bankItems]);
 
   // Global Keyboard Shortcuts (Guard: Do NOT trigger when typing in inputs/textareas)

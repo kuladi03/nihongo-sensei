@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import date, datetime, timedelta
@@ -12,6 +13,19 @@ logger = logging.getLogger("database")
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "nihongo.db"
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+
+SMALL_KANA = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ")
+
+def is_valid_kana_item(text: str) -> bool:
+    """Strictly validates if text is an individual Hiragana/Katakana character or valid 2-char yōon combination."""
+    if not text:
+        return False
+    t = str(text).strip()
+    if len(t) == 1:
+        return bool(re.match(r'^[\u3040-\u309f\u30a0-\u30ff]$', t))
+    if len(t) == 2:
+        return bool(re.match(r'^[\u3040-\u309f\u30a0-\u30ff]', t[0])) and t[1] in SMALL_KANA
+    return False
 
 def get_db_path() -> Path:
     env_path = os.getenv("DATABASE_PATH")
@@ -350,13 +364,39 @@ def get_connection(db_path: Optional[Path] = None):
         pass
     return conn
 
+def migrate_kana_classifications(conn: Optional[Any] = None) -> int:
+    """Migrates any multi-character words incorrectly classified as KANA to VOCAB."""
+    close_at_end = False
+    if conn is None:
+        conn = get_connection()
+        close_at_end = True
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, japanese FROM mastery_items WHERE item_type = 'KANA'")
+        rows = cur.fetchall()
+        to_update = []
+        for r in rows:
+            jp = r["japanese"]
+            if not is_valid_kana_item(jp):
+                to_update.append(r["id"])
+        if to_update:
+            for item_id in to_update:
+                cur.execute("UPDATE mastery_items SET item_type = 'VOCAB' WHERE id = ?", (item_id,))
+            conn.commit()
+            print(f"🧹 [MIGRATION] Reclassified {len(to_update)} multi-character items from KANA to VOCAB.")
+        return len(to_update)
+    finally:
+        if close_at_end:
+            conn.close()
+
 def init_database(db_path: Optional[Path] = None):
-    """Initializes tables using schema.sql."""
+    """Initializes tables using schema.sql and runs essential data migrations."""
     conn = get_connection(db_path)
     with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
         schema_sql = f.read()
     with conn:
         conn.executescript(schema_sql)
+    migrate_kana_classifications(conn)
     conn.close()
 
 # --- Notion Sync State ---
@@ -492,6 +532,8 @@ def upsert_mastery_item(
     next_review_date: Optional[str] = None,
     conn: Optional[Any] = None
 ) -> int:
+    if item_type == "KANA" and not is_valid_kana_item(japanese):
+        item_type = "VOCAB"
     close_at_end = False
     if conn is None:
         conn = get_connection()
@@ -579,6 +621,8 @@ def batch_upsert_mastery_items(
                 continue
 
             item_type = card.get("item_type", "VOCAB")
+            if item_type == "KANA" and not is_valid_kana_item(japanese):
+                item_type = "VOCAB"
             kana_only = card.get("kana_only")
             romaji = card.get("romaji")
             english = card.get("english")

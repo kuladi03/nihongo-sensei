@@ -28,6 +28,7 @@ from db.database import (
     get_due_mastery_items,
     get_all_units,
     get_connection,
+    invalidate_cache_prefix,
 )
 
 ensure_env_loaded()
@@ -60,7 +61,24 @@ def build_all_units(force: bool = False) -> List[Dict[str, Any]]:
             existing_unit = get_unit(idx)
 
         unit_num = existing_unit["unit_number"] if existing_unit else idx
-        needs_rebuild = force or (existing_unit is None) or (existing_unit.get("content_hash") != c["content_hash"])
+
+        # Automated check: if an existing unit has 0 mastery items or 0 study cards, trigger rebuild
+        mastery_count = 0
+        if existing_unit:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT count(*) FROM mastery_items WHERE unit_id = ?", (existing_unit["id"],))
+            row = cur.fetchone()
+            mastery_count = row[0] if row else 0
+            conn.close()
+
+        cards_in_lesson = len(existing_unit.get("lesson_data", {}).get("study_cards", [])) if existing_unit else 0
+        is_empty_or_broken = existing_unit is not None and (mastery_count == 0 or cards_in_lesson == 0)
+
+        needs_rebuild = force or (existing_unit is None) or (existing_unit.get("content_hash") != c["content_hash"]) or is_empty_or_broken
+
+        if is_empty_or_broken:
+            print(f"⚠️ Unit {unit_num:02d} ('{existing_unit['title']}') is missing cards in DB ({mastery_count} mastery items, {cards_in_lesson} study cards). Rebuilding automatically...")
 
         if not needs_rebuild:
             print(f"✨ Unit {unit_num:02d} ('{existing_unit['title']}') is already up to date. Syncing any missing mastery cards.")
@@ -132,6 +150,12 @@ def build_all_units(force: bool = False) -> List[Dict[str, Any]]:
     if boss:
         print(f"🏆 Boss Checkpoint Unit created: {boss['unit_title']}")
         built_units.append(boss)
+
+    # Invalidate all affected caches
+    invalidate_cache_prefix("bank:")
+    invalidate_cache_prefix("due:")
+    invalidate_cache_prefix("roadmap:")
+    invalidate_cache_prefix("unit:")
 
     print(f"\n🎉 Curriculum build completed! {len(built_units)} units available in SQLite.")
     return built_units

@@ -6,6 +6,10 @@ using Gemini with Pydantic structured output and SM-2 cross-unit revision weavin
 import os
 import sys
 import json
+import time
+import requests
+import re
+import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
@@ -14,12 +18,9 @@ from pydantic import BaseModel, Field
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from agents.notion_agent import ensure_env_loaded
-from db.database import get_due_mastery_items
+from db.database import get_due_mastery_items, is_valid_kana_item
 
 ensure_env_loaded()
-
-import re
-import hashlib
 
 # --- Pydantic Data Contract ---
 class StudyCard(BaseModel):
@@ -220,20 +221,102 @@ def chunk_markdown_by_headings(raw_markdown: str, max_chunk_chars: int = 4000) -
         chunks.append('\n'.join(current_chunk))
     return chunks
 
+def _clean_json_str(text: str) -> str:
+    """Strips markdown code blocks and excess whitespace from LLM JSON responses."""
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
+
 class CurriculumAgent:
-    FALLBACK_MODELS = [
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash-lite",
-        "gemini-3.8-flash",
+    GEMINI_MODELS = [
         "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.8-flash",
+    ]
+    GROQ_MODELS = [
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b",
     ]
 
     def __init__(self, api_key: Optional[str] = None):
+        ensure_env_loaded()
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY is required.")
-        from google import genai
-        self.client = genai.Client(api_key=self.api_key)
+        self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        if not self.api_key and not self.groq_api_key:
+            raise ValueError("Either GEMINI_API_KEY or GROQ_API_KEY is required.")
+        self.client = None
+        if self.api_key:
+            try:
+                from google import genai
+                self.client = genai.Client(api_key=self.api_key)
+            except Exception as e:
+                print(f"⚠️ Failed to initialize Gemini genai.Client: {e}")
+
+    def _call_groq(
+        self,
+        contents: str,
+        system_instruction: str,
+        response_schema: Any,
+        temperature: float = 0.0,
+        max_tokens: int = 8192
+    ) -> Any:
+        groq_key = self.groq_api_key or os.environ.get("GROQ_API_KEY", "").strip()
+        if not groq_key:
+            raise RuntimeError("GROQ_API_KEY is not configured in environment.")
+
+        schema_json = json.dumps(response_schema.model_json_schema(), ensure_ascii=False)
+        sys_prompt = (
+            f"{system_instruction}\n\n"
+            "CRITICAL INSTRUCTION: You MUST return a single, valid JSON object matching the following JSON Schema strictly. "
+            "Do NOT output markdown blocks, explanatory text, or any prelude/postlude.\n"
+            f"JSON SCHEMA:\n{schema_json}"
+        )
+
+        last_error = None
+        for model in self.GROQ_MODELS:
+            try:
+                print(f"⚡ [GROQ] Calling model '{model}' with JSON mode...")
+                headers = {
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": contents},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=90.0,
+                )
+                if resp.status_code == 200:
+                    raw_content = resp.json()["choices"][0]["message"]["content"]
+                    cleaned = _clean_json_str(raw_content)
+                    return response_schema.model_validate_json(cleaned)
+                else:
+                    err_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    print(f"⚠️ [GROQ] Model '{model}' error: {err_msg}")
+                    last_error = RuntimeError(err_msg)
+            except Exception as e:
+                print(f"⚠️ [GROQ] Model '{model}' exception: {e}")
+                last_error = e
+                continue
+
+        raise RuntimeError(f"All Groq models failed. Last error: {last_error}")
 
     def _call_model(
         self,
@@ -243,30 +326,54 @@ class CurriculumAgent:
         temperature: float = 0.0,
         max_tokens: int = 8192
     ) -> Any:
-        from google.genai import types
         last_error = None
-        for model in self.FALLBACK_MODELS:
-            try:
-                resp = self.client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
-                    ),
-                )
-                if resp.text:
-                    return response_schema.model_validate_json(resp.text)
-            except Exception as e:
-                err_str = str(e)
-                print(f"⚠️ Model '{model}' error: {err_str[:120]}... Trying next model.")
-                last_error = e
-                continue
 
-        raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+        # 1. Try Gemini models first if client is initialized
+        if self.client:
+            from google.genai import types
+            for model in self.GEMINI_MODELS:
+                for attempt in range(3):  # Initial try + up to 2 retries on 503
+                    try:
+                        resp = self.client.models.generate_content(
+                            model=model,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_instruction,
+                                response_mime_type="application/json",
+                                response_schema=response_schema,
+                                temperature=temperature,
+                                max_output_tokens=max_tokens,
+                            ),
+                        )
+                        if resp.text:
+                            cleaned = _clean_json_str(resp.text)
+                            return response_schema.model_validate_json(cleaned)
+                    except Exception as e:
+                        err_str = str(e)
+                        is_503 = "503" in err_str or "unavailable" in err_str.lower()
+                        if is_503 and attempt < 2:
+                            backoff = 2 ** (attempt + 1)  # 2s on attempt 0, 4s on attempt 1
+                            print(f"⚠️ Model '{model}' 503 UNAVAILABLE. Retrying in {backoff}s (attempt {attempt + 1}/3)...")
+                            time.sleep(backoff)
+                            continue
+                        else:
+                            print(f"⚠️ Model '{model}' error: {err_str[:120]}... Trying next model.")
+                            last_error = e
+                            break
+
+        # 2. Fall back to Groq OpenAI-compatible endpoint
+        print("🔄 [FALLBACK] All Gemini models failed or unavailable. Falling back to Groq...")
+        try:
+            return self._call_groq(
+                contents=contents,
+                system_instruction=system_instruction,
+                response_schema=response_schema,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as ge:
+            print(f"❌ [FALLBACK] Groq fallback also failed: {ge}")
+            raise RuntimeError(f"All Gemini and Groq models failed. Gemini error: {last_error} | Groq error: {ge}")
 
     def generate_unit(
         self,
@@ -295,7 +402,8 @@ class CurriculumAgent:
             "number/time pattern, grammar structure, and Marathi phonetic trap from the notes. "
             "Do NOT summarize, sample, or omit basic/early items. "
             "Preserve exact Marathi explanations, nuances, and pronunciation tips from the class notes. "
-            "Assign each card an appropriate item_type ('KANA', 'VOCAB', 'GRAMMAR', 'PHRASE'). "
+            "CRITICAL ITEM_TYPE RULE: Assign item_type as 'KANA' ONLY for individual Japanese syllabary characters (single Hiragana/Katakana characters like 'あ', 'か', or 2-char yōon combinations like 'きゃ', 'しゅ'). "
+            "Full vocabulary words, greetings, and expressions (e.g. ありがとう, いす, さようなら, ねこ, いぬ) MUST be assigned item_type 'VOCAB' or 'PHRASE', NEVER 'KANA'. "
             "CRITICAL HIRAGANA RULE: NEVER produce standalone Kanji without Hiragana reading. Whenever 'japanese' contains Kanji, "
             "you MUST either format it inline with its Hiragana reading in parentheses (e.g. 携帯 (けいたい), お茶 (おちゃ)) OR populate 'kana_only' with the pure Hiragana reading. Never leave bare Kanji without its Hiragana reading."
         )
@@ -304,21 +412,23 @@ class CurriculumAgent:
             if len(chunk.strip()) < 50:
                 continue
             prompt = f"Extract all study cards exhaustively from this section of Unit {unit_number:02d} class notes:\n\n{chunk}"
-            try:
-                chunk_res = self._call_model(
-                    contents=prompt,
-                    system_instruction=card_instruction,
-                    response_schema=ExtractedCards,
-                    temperature=0.0,
-                    max_tokens=8192,
-                )
-                for card in chunk_res.study_cards:
-                    key = card.japanese.strip()
-                    if key:
-                        extracted_cards[key] = card
-                print(f"  -> Chunk {i}/{len(chunks)}: extracted {len(chunk_res.study_cards)} cards.")
-            except Exception as e:
-                print(f"⚠️ Failed extracting cards from chunk {i}: {e}")
+            # Strict error handling: if extraction fails across all models, raise to abort partial save!
+            chunk_res = self._call_model(
+                contents=prompt,
+                system_instruction=card_instruction,
+                response_schema=ExtractedCards,
+                temperature=0.0,
+                max_tokens=8192,
+            )
+            for card in chunk_res.study_cards:
+                raw_jp = (card.japanese or "").strip()
+                # Sanitize: only genuine single/yōon Kana can have item_type='KANA'
+                if card.item_type == "KANA" and not is_valid_kana_item(raw_jp):
+                    card.item_type = "VOCAB"
+                key = raw_jp
+                if key:
+                    extracted_cards[key] = card
+            print(f"  -> Chunk {i}/{len(chunks)}: extracted {len(chunk_res.study_cards)} cards.")
 
         # 3. Merge deterministic Kana into cards
         for kana_card in deterministic_kana:
