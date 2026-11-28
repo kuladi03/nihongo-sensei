@@ -14,7 +14,7 @@ import {
 import { motion } from 'framer-motion';
 
 export default function BentoDrawer({ unit, onClose }) {
-  const { openUnit, authFetch } = useApp();
+  const { openUnit, fetchUnitData } = useApp();
   const [unitData, setUnitData] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -23,8 +23,7 @@ export default function BentoDrawer({ unit, onClose }) {
     let isMounted = true;
     setLoading(true);
 
-    authFetch(`/api/units/${unit.unit_number}`)
-      .then((res) => (res.ok ? res.json() : null))
+    fetchUnitData(unit.unit_number)
       .then((data) => {
         if (isMounted && data) {
           setUnitData(data);

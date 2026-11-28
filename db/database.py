@@ -72,6 +72,18 @@ def clear_cache():
     CACHE.clear()
 
 # --- Turso / LibSQL Cloud Support ---
+HRANA_STREAM_ERROR_PATTERNS = [
+    "stream not found",
+    "stream_expired",
+    "stream has expired",
+    "hrana_closed",
+    "404 not found",
+]
+
+def _is_hrana_stream_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(p in msg for p in HRANA_STREAM_ERROR_PATTERNS)
+
 class TursoRow:
     """sqlite3.Row compatible wrapper for libsql query results."""
     def __init__(self, cols: List[str], values: tuple):
@@ -97,20 +109,51 @@ class TursoRow:
         return repr(self._d)
 
 class TursoCursor:
-    """Cursor wrapper for libsql returning TursoRow instances."""
-    def __init__(self, cur):
+    """Cursor wrapper for libsql returning TursoRow instances with Hrana auto-recovery."""
+    def __init__(self, cur, parent_conn: Optional['TursoConnection'] = None):
         self._cur = cur
+        self._parent = parent_conn
 
     def execute(self, sql: str, params=()):
-        if params:
-            self._cur.execute(sql, tuple(params))
-        else:
-            self._cur.execute(sql)
-        return self
+        global _last_libsql_activity
+        _last_libsql_activity = time.time()
+        p = tuple(params) if params else ()
+        try:
+            if p:
+                self._cur.execute(sql, p)
+            else:
+                self._cur.execute(sql)
+            return self
+        except Exception as e:
+            if self._parent and self._parent.is_singleton and _is_hrana_stream_error(e):
+                print(f"⚠️ [TURSO] Hrana stream error in cursor.execute: {e}. Reconnecting & retrying once...")
+                _reset_libsql_connection()
+                fresh_raw = self._parent._raw_conn()
+                if fresh_raw is not None:
+                    self._cur = fresh_raw.cursor()
+                    if p:
+                        self._cur.execute(sql, p)
+                    else:
+                        self._cur.execute(sql)
+                    return self
+            raise
 
     def executemany(self, sql: str, seq_of_params):
-        self._cur.executemany(sql, seq_of_params)
-        return self
+        global _last_libsql_activity
+        _last_libsql_activity = time.time()
+        try:
+            self._cur.executemany(sql, seq_of_params)
+            return self
+        except Exception as e:
+            if self._parent and self._parent.is_singleton and _is_hrana_stream_error(e):
+                print(f"⚠️ [TURSO] Hrana stream error in cursor.executemany: {e}. Reconnecting & retrying once...")
+                _reset_libsql_connection()
+                fresh_raw = self._parent._raw_conn()
+                if fresh_raw is not None:
+                    self._cur = fresh_raw.cursor()
+                    self._cur.executemany(sql, seq_of_params)
+                    return self
+            raise
 
     def fetchone(self) -> Optional[TursoRow]:
         r = self._cur.fetchone()
@@ -131,7 +174,10 @@ class TursoCursor:
         return getattr(self._cur, "lastrowid", None)
 
     def close(self):
-        self._cur.close()
+        try:
+            self._cur.close()
+        except Exception:
+            pass
 
     def __getattr__(self, name):
         return getattr(self._cur, name)
@@ -143,8 +189,17 @@ class TursoConnection:
         self.is_singleton = is_singleton
         self.row_factory = None
 
+    def _raw_conn(self):
+        if self.is_singleton:
+            raw = _get_or_create_libsql_connection()
+            if raw is not None:
+                self._conn = raw
+            return self._conn
+        return self._conn
+
     def cursor(self) -> TursoCursor:
-        return TursoCursor(self._conn.cursor())
+        raw = self._raw_conn()
+        return TursoCursor(raw.cursor(), parent_conn=self)
 
     def execute(self, sql: str, params=()) -> TursoCursor:
         cur = self.cursor()
@@ -152,22 +207,52 @@ class TursoConnection:
         return cur
 
     def executescript(self, script: str):
-        self._conn.executescript(script)
-        self._conn.commit()
+        global _last_libsql_activity
+        _last_libsql_activity = time.time()
+        try:
+            self._raw_conn().executescript(script)
+            self._raw_conn().commit()
+        except Exception as e:
+            if self.is_singleton and _is_hrana_stream_error(e):
+                print(f"⚠️ [TURSO] Hrana stream error in executescript: {e}. Reconnecting & retrying once...")
+                _reset_libsql_connection()
+                self._raw_conn().executescript(script)
+                self._raw_conn().commit()
+                return
+            raise
 
     def commit(self):
-        self._conn.commit()
+        global _last_libsql_activity
+        _last_libsql_activity = time.time()
+        try:
+            self._raw_conn().commit()
+        except Exception as e:
+            if self.is_singleton and _is_hrana_stream_error(e):
+                print(f"⚠️ [TURSO] Hrana stream error in commit: {e}. Reconnecting...")
+                _reset_libsql_connection()
+                try:
+                    self._raw_conn().commit()
+                except Exception:
+                    pass
+                return
+            raise
 
     def rollback(self):
-        self._conn.rollback()
+        try:
+            self._raw_conn().rollback()
+        except Exception:
+            pass
 
     def close(self):
         if self.is_singleton:
             return
-        self._conn.close()
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     def __getattr__(self, name):
-        return getattr(self._conn, name)
+        return getattr(self._raw_conn(), name)
 
     def __enter__(self):
         return self
@@ -180,6 +265,8 @@ class TursoConnection:
 
 _libsql_singleton = None
 _libsql_lock = threading.RLock()
+_TURSO_MAX_IDLE_SECONDS = 600  # 10 minutes
+_last_libsql_activity = 0.0
 
 def is_turso_configured() -> bool:
     return bool(os.getenv("TURSO_DATABASE_URL", "").strip())
@@ -200,22 +287,56 @@ def _cleanup_stale_replicas():
 # Cleanup any stale replica files on startup
 _cleanup_stale_replicas()
 
-def get_connection(db_path: Optional[Path] = None):
-    global _libsql_singleton
+def _get_or_create_libsql_connection():
+    global _libsql_singleton, _last_libsql_activity
     turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
     turso_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
-    if turso_url and not db_path:
-        with _libsql_lock:
-            if _libsql_singleton is None:
-                try:
-                    import libsql_experimental as libsql
-                    _libsql_singleton = libsql.connect(database=turso_url, auth_token=turso_token or None)
-                    print(f"✅ [TURSO] Connected directly to remote Turso cloud at {turso_url}.")
-                except Exception as e:
-                    print(f"⚠️ [TURSO] Failed to connect directly to Turso: {e}. Falling back to local SQLite.")
+    if not turso_url:
+        return None
 
-            if _libsql_singleton is not None:
-                return TursoConnection(_libsql_singleton, is_singleton=True)
+    with _libsql_lock:
+        now = time.time()
+        # Check if idle for >10 minutes
+        if _libsql_singleton is not None and (now - _last_libsql_activity > _TURSO_MAX_IDLE_SECONDS):
+            print(f"⏰ [TURSO] Singleton connection idle for {int(now - _last_libsql_activity)}s (>10m). Recycling connection...")
+            try:
+                _libsql_singleton.close()
+            except Exception:
+                pass
+            _libsql_singleton = None
+
+        if _libsql_singleton is None:
+            try:
+                import libsql_experimental as libsql
+                _libsql_singleton = libsql.connect(database=turso_url, auth_token=turso_token or None)
+                _last_libsql_activity = time.time()
+                print(f"✅ [TURSO] Connected directly to remote Turso cloud at {turso_url}.")
+            except Exception as e:
+                print(f"⚠️ [TURSO] Failed to connect directly to Turso: {e}. Falling back to local SQLite.")
+                return None
+        else:
+            _last_libsql_activity = now
+
+        return _libsql_singleton
+
+def _reset_libsql_connection():
+    """Safely closes dead singleton and establishes a fresh connection."""
+    global _libsql_singleton, _last_libsql_activity
+    with _libsql_lock:
+        if _libsql_singleton is not None:
+            try:
+                _libsql_singleton.close()
+            except Exception:
+                pass
+            _libsql_singleton = None
+        return _get_or_create_libsql_connection()
+
+def get_connection(db_path: Optional[Path] = None):
+    turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
+    if turso_url and not db_path:
+        raw = _get_or_create_libsql_connection()
+        if raw is not None:
+            return TursoConnection(raw, is_singleton=True)
 
     target = db_path or get_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -307,6 +428,8 @@ def save_unit(
             conn.commit()
         # Invalidate read cache
         CACHE.invalidate(f"unit:{unit_number}")
+        CACHE.invalidate(f"unit:base:{unit_number}")
+        CACHE.invalidate_prefix("user_prog:")
         CACHE.invalidate_prefix("roadmap:")
         CACHE.invalidate_prefix("bank:")
         CACHE.invalidate_prefix("due:")
@@ -496,6 +619,7 @@ def batch_upsert_mastery_items(
 
         if close_at_end:
             conn.commit()
+        CACHE.invalidate_prefix("unit:base:")
         CACHE.invalidate_prefix("bank:")
         CACHE.invalidate_prefix("due:")
         return count
@@ -1012,6 +1136,7 @@ def batch_submit_progress(
     CACHE.invalidate(f"roadmap:{user_id}")
     CACHE.invalidate(f"user:id:{user_id}")
     CACHE.invalidate_prefix(f"user:{user_id}")
+    CACHE.invalidate_prefix(f"user_prog:{user_id}")
 
     # 7. Zero-overhead Boss milestone check: only runs when unit is completed AND is a multiple of 5
     boss_unit_unlocked = False

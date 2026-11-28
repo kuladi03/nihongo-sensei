@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 
 const AppContext = createContext(null);
 
@@ -6,6 +6,9 @@ export function AppProvider({ children }) {
   // Authentication State
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
+
+  // In-Memory Unit Cache to make drill and study deck navigation instantaneous
+  const unitCacheRef = useRef({});
 
   // 3-Mode Script Display: 'assist' (Stacked Romaji) | 'kana' (Hover/Tap Peek) | 'native' (Pure Japanese)
   const [scriptMode, setScriptMode] = useState(() => {
@@ -329,6 +332,7 @@ export function AppProvider({ children }) {
         throw new Error(buildData.error || "Unit build failed.");
       }
 
+      unitCacheRef.current = {};
       await fetchRoadmap();
       await fetchDueItems();
       await fetchBank();
@@ -341,13 +345,41 @@ export function AppProvider({ children }) {
     }
   };
 
-  // Open a specific unit
-  const openUnit = async (unitNumber, viewType = 'study_deck') => {
+  // Fetch unit data with client-side memory caching
+  const fetchUnitData = async (unitNumber, forceReload = false) => {
+    const key = String(unitNumber);
+    if (!forceReload && unitCacheRef.current[key]) {
+      return unitCacheRef.current[key];
+    }
+    const res = await authFetch(`/api/units/${unitNumber}`);
+    if (res.ok) {
+      const data = await res.json();
+      unitCacheRef.current[key] = data;
+      return data;
+    }
+    return null;
+  };
+
+  // Open a specific unit with instant memory caching
+  const openUnit = async (unitNumber, viewType = 'study_deck', forceReload = false) => {
+    const key = String(unitNumber);
+    // 1. Instant view transition if already on this unit
+    if (!forceReload && activeUnit && String(activeUnit.unit_number) === key) {
+      setActiveView(viewType);
+      return;
+    }
+
+    // 2. Instant transition if cached in memory (< 1ms)
+    if (!forceReload && unitCacheRef.current[key]) {
+      setActiveUnit(unitCacheRef.current[key]);
+      setActiveView(viewType);
+      return;
+    }
+
     setLoading(true);
     try {
-      const res = await authFetch(`/api/units/${unitNumber}`);
-      if (res.ok) {
-        const data = await res.json();
+      const data = await fetchUnitData(unitNumber, forceReload);
+      if (data) {
         setActiveUnit(data);
         setActiveView(viewType);
       } else {
@@ -377,6 +409,17 @@ export function AppProvider({ children }) {
 
       if (res.ok) {
         const data = await res.json();
+        const key = String(unitNumber);
+        if (unitCacheRef.current[key]) {
+          unitCacheRef.current[key] = {
+            ...unitCacheRef.current[key],
+            is_completed: isCompleted,
+          };
+        }
+        if (activeUnit && String(activeUnit.unit_number) === key) {
+          setActiveUnit(prev => (prev ? { ...prev, is_completed: isCompleted } : prev));
+        }
+
         const totalXp = data.total_xp !== undefined ? data.total_xp : data.user_xp;
         const streakVal = data.streak !== undefined ? data.streak : data.user_streak;
 
@@ -463,6 +506,7 @@ export function AppProvider({ children }) {
         notification,
         showToast,
         syncNotion,
+        fetchUnitData,
         openUnit,
         submitProgress,
         gradeReviewItem,

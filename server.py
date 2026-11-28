@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, date, timedelta
 import logging
+import copy
 
 # Ensure parent directory is in sys.path
 sys.path.append(str(Path(__file__).resolve().parent))
@@ -66,6 +67,7 @@ from db.database import (
     get_all_notion_page_sync_states,
     upsert_notion_page_sync_state,
     is_turso_configured,
+    CACHE,
     invalidate_cache,
     invalidate_cache_prefix,
     clear_cache,
@@ -669,28 +671,22 @@ async def get_roadmap(request: Request):
         "roadmap": roadmap,
     }
 
-@app.get("/api/units/{unit_number}")
-async def get_unit_details(unit_number: int, request: Request):
-    user = require_user(request)
+def get_prepared_unit_base(unit_number: int) -> Optional[Dict[str, Any]]:
+    """Fetches and prepares base unit curriculum data (exercises, cards, romaji) with in-memory caching."""
+    cache_key = f"unit:base:{unit_number}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+
     unit = get_unit(unit_number)
     if not unit:
-        raise HTTPException(status_code=404, detail=f"Unit {unit_number} not found.")
-
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT is_completed FROM user_unit_progress WHERE user_id = ? AND unit_number = ?",
-        (user["id"], unit_number)
-    )
-    user_prog = cur.fetchone()
-    is_comp = bool(user_prog["is_completed"]) if user_prog else False
+        return None
 
     mastery = get_mastery_items_for_unit(unit["id"])
-    unit_data = unit.get("lesson_data", {})
+    unit_data = copy.deepcopy(unit.get("lesson_data", {}))
     unit_data["unit_id"] = unit["id"]
     unit_data["unit_number"] = unit["unit_number"]
     unit_data["unit_type"] = unit.get("unit_type", "DAILY")
-    unit_data["is_completed"] = is_comp
     unit_data["mastery_item_count"] = len(mastery)
 
     mastery_map = {}
@@ -712,6 +708,8 @@ async def get_unit_details(unit_number: int, request: Request):
             display = f"{jp}（{kana}）" if kana and kana != jp and re.search(r'[\u4e00-\u9fff]', jp) else jp
             romaji_lookup[key] = (display, romaji.lower(), jp)
 
+    conn = get_connection()
+    cur = conn.cursor()
     cur.execute("SELECT japanese, kana_only, romaji FROM mastery_items")
     for r in cur.fetchall():
         jp = r["japanese"]
@@ -788,7 +786,37 @@ async def get_unit_details(unit_number: int, request: Request):
         if not card.get("romaji"):
             card["romaji"] = annotate_romaji(card.get("kana_only") or card.get("japanese") or "")
 
-    return unit_data
+    CACHE.set(cache_key, unit_data, ttl=86400)
+    return copy.deepcopy(unit_data)
+
+@app.get("/api/units/{unit_number}")
+async def get_unit_details(unit_number: int, request: Request):
+    user = require_user(request)
+    base_unit = await asyncio.to_thread(get_prepared_unit_base, unit_number)
+    if not base_unit:
+        raise HTTPException(status_code=404, detail=f"Unit {unit_number} not found.")
+
+    def _get_user_completion(user_id: int, u_num: int) -> bool:
+        cache_key = f"user_prog:{user_id}:{u_num}"
+        cached = CACHE.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT is_completed FROM user_unit_progress WHERE user_id = ? AND unit_number = ?",
+            (user_id, u_num)
+        )
+        user_prog = cur.fetchone()
+        conn.close()
+        is_comp = bool(user_prog["is_completed"]) if user_prog else False
+        CACHE.set(cache_key, is_comp, ttl=60)
+        return is_comp
+
+    is_comp = await asyncio.to_thread(_get_user_completion, user["id"], unit_number)
+    res = dict(base_unit)
+    res["is_completed"] = is_comp
+    return res
 
 # -------------------- Bank & Review --------------------
 @app.get("/api/bank")
