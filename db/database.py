@@ -450,6 +450,31 @@ def save_unit(
         close_at_end = True
     try:
         cur = conn.cursor()
+        # Ensure parent row exists in notion_sync_state if notion_page_id is provided
+        if notion_page_id:
+            cur.execute("SELECT 1 FROM notion_sync_state WHERE page_id = ?", (notion_page_id,))
+            if not cur.fetchone():
+                if unit_type.startswith("BOSS") or str(notion_page_id).startswith("boss_"):
+                    cur.execute("""
+                        INSERT INTO notion_sync_state (page_id, title, content_hash, raw_markdown, last_edited_time, synced_at)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(page_id) DO UPDATE SET
+                            title = excluded.title,
+                            content_hash = excluded.content_hash,
+                            raw_markdown = excluded.raw_markdown,
+                            last_edited_time = excluded.last_edited_time,
+                            synced_at = CURRENT_TIMESTAMP;
+                    """, (
+                        notion_page_id,
+                        f"Synthetic Note: {title}",
+                        content_hash or "boss_milestone",
+                        f"Synthetic Boss Unit parent note for {title}",
+                        datetime.now().isoformat()
+                    ))
+                else:
+                    logger.warning("notion_page_id '%s' not found in notion_sync_state for unit %s. Falling back to NULL.", notion_page_id, unit_number)
+                    notion_page_id = None
+
         cur.execute("""
             INSERT INTO units (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, is_completed, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)

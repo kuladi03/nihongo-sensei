@@ -17,6 +17,7 @@ from db.database import (
     update_mastery_srs,
     save_unit,
     get_all_units,
+    batch_upsert_mastery_items,
 )
 
 ensure_env_loaded()
@@ -125,7 +126,7 @@ class MemoryBossAgent:
         }
 
     # --- 5-Unit Boss Checkpoint Generator ---
-    def maybe_generate_boss_unit(self) -> Optional[Dict[str, Any]]:
+    def maybe_generate_boss_unit(self, force: bool = False) -> Optional[Dict[str, Any]]:
         """
         Checks if a 5-unit block is completed. If count(DAILY) % 5 == 0 and
         no BOSS_5 unit exists for this milestone, builds a cumulative Boss Unit.
@@ -140,7 +141,7 @@ class MemoryBossAgent:
         boss_unit_num = daily_count + (daily_count // 5)
         # Check if boss unit already exists
         boss_exists = any(u.get("unit_number") == boss_unit_num for u in all_units)
-        if boss_exists:
+        if boss_exists and not force:
             return None
 
         start_unit = daily_count - 4
@@ -190,16 +191,26 @@ REQUIREMENTS:
         media = MediaEnricherAgent()
         enriched = media.enrich_unit(boss_dict)
 
-        # Save to database
-        unit_id = save_unit(
-            unit_number=boss_unit_num,
-            title=enriched["unit_title"],
-            lesson_json=json.dumps(enriched, ensure_ascii=False),
-            unit_type="BOSS_5",
-            notion_page_id=f"boss_{start_unit}_{end_unit}",
-            content_hash="boss_milestone",
-            is_completed=False,
-        )
+        # Save to database in a single transaction (parent units row first, then study_cards)
+        conn = get_connection()
+        try:
+            with conn:
+                unit_id = save_unit(
+                    unit_number=boss_unit_num,
+                    title=enriched["unit_title"],
+                    lesson_json=json.dumps(enriched, ensure_ascii=False),
+                    unit_type="BOSS_5",
+                    notion_page_id=f"boss_{start_unit}_{end_unit}",
+                    content_hash="boss_milestone",
+                    is_completed=False,
+                    conn=conn,
+                )
+
+                cards = enriched.get("study_cards", [])
+                if cards:
+                    batch_upsert_mastery_items(unit_id=unit_id, cards=cards, conn=conn)
+        finally:
+            conn.close()
 
         return enriched
 

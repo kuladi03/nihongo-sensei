@@ -146,10 +146,26 @@ def build_all_units(force: bool = False) -> List[Dict[str, Any]]:
         built_units.append(enriched_dict)
 
     # Check for 5-Unit Boss Checkpoint
-    boss = boss_agent.maybe_generate_boss_unit()
+    boss = boss_agent.maybe_generate_boss_unit(force=force)
     if boss:
-        print(f"🏆 Boss Checkpoint Unit created: {boss['unit_title']}")
+        print(f"🏆 Boss Checkpoint Unit created/updated: {boss['unit_title']}")
         built_units.append(boss)
+    else:
+        # If boss units already exist, sync any missing mastery cards and include in built_units
+        all_units = get_all_units()
+        boss_units = [u for u in all_units if u.get("unit_type") == "BOSS_5"]
+        for bu in boss_units:
+            full_bu = get_unit(bu["unit_number"])
+            if full_bu:
+                b_cards = full_bu.get("lesson_data", {}).get("study_cards", [])
+                if b_cards:
+                    conn = get_connection()
+                    try:
+                        with conn:
+                            batch_upsert_mastery_items(unit_id=full_bu["id"], cards=b_cards, conn=conn)
+                    finally:
+                        conn.close()
+                built_units.append(full_bu.get("lesson_data", {}))
 
     # Invalidate all affected caches
     invalidate_cache_prefix("bank:")
