@@ -70,7 +70,7 @@ class MemoryBossAgent:
         """
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, ease_factor, interval_days, repetitions, wrong_count, japanese FROM mastery_items WHERE id = ?", (item_id,))
+        cur.execute("SELECT id, ease_factor, interval_days, repetitions, wrong_count, japanese FROM mastery_items WHERE id = %s", (item_id,))
         row = cur.fetchone()
         conn.close()
 
@@ -154,7 +154,7 @@ class MemoryBossAgent:
         cur.execute("""
             SELECT m.* FROM mastery_items m
             JOIN units u ON m.unit_id = u.id
-            WHERE u.unit_number BETWEEN ? AND ?
+            WHERE u.unit_number BETWEEN %s AND %s
             ORDER BY m.wrong_count DESC
             LIMIT 30
         """, (start_unit, end_unit))

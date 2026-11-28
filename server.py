@@ -461,7 +461,7 @@ async def websocket_live_session(websocket: WebSocket):
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    db_type = "Turso Remote SQLite" if is_turso_configured() else "Local SQLite (db/nihongo.db)"
+    db_type = "Neon PostgreSQL (psycopg_pool)"
     return {
         "status": "online",
         "app": "Nihongo Sensei",
@@ -804,7 +804,7 @@ async def get_unit_details(unit_number: int, request: Request):
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT is_completed FROM user_unit_progress WHERE user_id = ? AND unit_number = ?",
+            "SELECT is_completed FROM user_unit_progress WHERE user_id = %s AND unit_number = %s",
             (user_id, u_num)
         )
         user_prog = cur.fetchone()

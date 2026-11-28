@@ -67,9 +67,9 @@ def build_all_units(force: bool = False) -> List[Dict[str, Any]]:
         if existing_unit:
             conn = get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT count(*) FROM mastery_items WHERE unit_id = ?", (existing_unit["id"],))
+            cur.execute("SELECT count(*) as count FROM mastery_items WHERE unit_id = %s", (existing_unit["id"],))
             row = cur.fetchone()
-            mastery_count = row[0] if row else 0
+            mastery_count = (row["count"] if isinstance(row, dict) else row[0]) if row else 0
             conn.close()
 
         cards_in_lesson = len(existing_unit.get("lesson_data", {}).get("study_cards", [])) if existing_unit else 0

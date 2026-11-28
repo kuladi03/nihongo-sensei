@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import json
 import logging
 import threading
@@ -9,9 +8,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import date, datetime, timedelta
 
+from psycopg.rows import dict_row
+from psycopg.pq import TransactionStatus
+from psycopg_pool import ConnectionPool
+
 logger = logging.getLogger("database")
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent / "nihongo.db"
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 SMALL_KANA = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ")
@@ -26,15 +28,6 @@ def is_valid_kana_item(text: str) -> bool:
     if len(t) == 2:
         return bool(re.match(r'^[\u3040-\u309f\u30a0-\u30ff]', t[0])) and t[1] in SMALL_KANA
     return False
-
-def get_db_path() -> Path:
-    env_path = os.getenv("DATABASE_PATH")
-    if env_path:
-        p = Path(env_path)
-        if not p.is_absolute():
-            p = Path(__file__).resolve().parent.parent / p
-        return p
-    return DEFAULT_DB_PATH
 
 # --- In-Memory Thread-Safe TTL Cache ---
 class InMemoryTTLCache:
@@ -85,107 +78,84 @@ def invalidate_cache_prefix(prefix: str):
 def clear_cache():
     CACHE.clear()
 
-# --- Turso / LibSQL Cloud Support ---
-HRANA_STREAM_ERROR_PATTERNS = [
-    "stream not found",
-    "stream_expired",
-    "stream has expired",
-    "hrana_closed",
-    "404 not found",
-]
+# --- Neon PostgreSQL Connection Pool ---
+_pool: Optional[ConnectionPool] = None
+_pool_lock = threading.RLock()
 
-def _is_hrana_stream_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(p in msg for p in HRANA_STREAM_ERROR_PATTERNS)
+def get_database_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if url:
+        return url
+    return "postgresql://localhost:5432/nihongo"
 
-class TursoRow:
-    """sqlite3.Row compatible wrapper for libsql query results."""
-    def __init__(self, cols: List[str], values: tuple):
-        self._d = dict(zip(cols, values))
-        self._v = list(values)
-        self._cols = cols
+def get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                db_url = get_database_url()
+                _pool = ConnectionPool(
+                    conninfo=db_url,
+                    min_size=0,
+                    max_size=10,
+                    max_idle=240.0,
+                    check=ConnectionPool.check_connection,
+                    kwargs={
+                        "row_factory": dict_row,
+                        "autocommit": False,
+                        "prepare_threshold": None,
+                    },
+                    open=True,
+                )
+    return _pool
 
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return self._v[key]
-        return self._d[key]
+def close_pool():
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            try:
+                _pool.close()
+            except Exception:
+                pass
+            _pool = None
 
-    def keys(self):
-        return self._d.keys()
+class CompatibleCursor:
+    """psycopg cursor wrapper providing seamless parameter adaptation and dict-like rows."""
+    def __init__(self, raw_cur):
+        self._cur = raw_cur
 
-    def get(self, k, default=None):
-        return self._d.get(k, default)
+    def execute(self, query: str, params=None):
+        if params is not None and "?" in query and "%s" not in query:
+            query = query.replace("?", "%s")
+        if params is not None:
+            p = tuple(params) if isinstance(params, (list, tuple)) else params
+            self._cur.execute(query, p)
+        else:
+            self._cur.execute(query)
+        return self
 
-    def __iter__(self):
-        return iter(self._d)
+    def executemany(self, query: str, seq_of_params):
+        if "?" in query and "%s" not in query:
+            query = query.replace("?", "%s")
+        self._cur.executemany(query, seq_of_params)
+        return self
 
-    def __repr__(self):
-        return repr(self._d)
+    def fetchone(self) -> Optional[Dict[str, Any]]:
+        return self._cur.fetchone()
 
-class TursoCursor:
-    """Cursor wrapper for libsql returning TursoRow instances with Hrana auto-recovery."""
-    def __init__(self, cur, parent_conn: Optional['TursoConnection'] = None):
-        self._cur = cur
-        self._parent = parent_conn
-
-    def execute(self, sql: str, params=()):
-        global _last_libsql_activity
-        _last_libsql_activity = time.time()
-        p = tuple(params) if params else ()
-        try:
-            if p:
-                self._cur.execute(sql, p)
-            else:
-                self._cur.execute(sql)
-            return self
-        except Exception as e:
-            if self._parent and self._parent.is_singleton and _is_hrana_stream_error(e):
-                print(f"⚠️ [TURSO] Hrana stream error in cursor.execute: {e}. Reconnecting & retrying once...")
-                _reset_libsql_connection()
-                fresh_raw = self._parent._raw_conn()
-                if fresh_raw is not None:
-                    self._cur = fresh_raw.cursor()
-                    if p:
-                        self._cur.execute(sql, p)
-                    else:
-                        self._cur.execute(sql)
-                    return self
-            raise
-
-    def executemany(self, sql: str, seq_of_params):
-        global _last_libsql_activity
-        _last_libsql_activity = time.time()
-        try:
-            self._cur.executemany(sql, seq_of_params)
-            return self
-        except Exception as e:
-            if self._parent and self._parent.is_singleton and _is_hrana_stream_error(e):
-                print(f"⚠️ [TURSO] Hrana stream error in cursor.executemany: {e}. Reconnecting & retrying once...")
-                _reset_libsql_connection()
-                fresh_raw = self._parent._raw_conn()
-                if fresh_raw is not None:
-                    self._cur = fresh_raw.cursor()
-                    self._cur.executemany(sql, seq_of_params)
-                    return self
-            raise
-
-    def fetchone(self) -> Optional[TursoRow]:
-        r = self._cur.fetchone()
-        if r is None:
-            return None
-        cols = [c[0] for c in self._cur.description]
-        return TursoRow(cols, r)
-
-    def fetchall(self) -> List[TursoRow]:
-        rows = self._cur.fetchall()
-        if not rows:
-            return []
-        cols = [c[0] for c in self._cur.description]
-        return [TursoRow(cols, r) for r in rows]
+    def fetchall(self) -> List[Dict[str, Any]]:
+        return self._cur.fetchall()
 
     @property
-    def lastrowid(self):
-        return getattr(self._cur, "lastrowid", None)
+    def rowcount(self) -> int:
+        return self._cur.rowcount
+
+    @property
+    def description(self):
+        return self._cur.description
+
+    def __iter__(self):
+        return iter(self._cur)
 
     def close(self):
         try:
@@ -193,176 +163,62 @@ class TursoCursor:
         except Exception:
             pass
 
-    def __getattr__(self, name):
-        return getattr(self._cur, name)
-
-class TursoConnection:
-    """Connection wrapper for libsql managing transactions and returning TursoCursor."""
-    def __init__(self, conn, is_singleton: bool = False):
-        self._conn = conn
-        self.is_singleton = is_singleton
-        self.row_factory = None
-
-    def _raw_conn(self):
-        if self.is_singleton:
-            raw = _get_or_create_libsql_connection()
-            if raw is not None:
-                self._conn = raw
-            return self._conn
-        return self._conn
-
-    def cursor(self) -> TursoCursor:
-        raw = self._raw_conn()
-        return TursoCursor(raw.cursor(), parent_conn=self)
-
-    def execute(self, sql: str, params=()) -> TursoCursor:
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur
-
-    def executescript(self, script: str):
-        global _last_libsql_activity
-        _last_libsql_activity = time.time()
-        try:
-            self._raw_conn().executescript(script)
-            self._raw_conn().commit()
-        except Exception as e:
-            if self.is_singleton and _is_hrana_stream_error(e):
-                print(f"⚠️ [TURSO] Hrana stream error in executescript: {e}. Reconnecting & retrying once...")
-                _reset_libsql_connection()
-                self._raw_conn().executescript(script)
-                self._raw_conn().commit()
-                return
-            raise
-
-    def commit(self):
-        global _last_libsql_activity
-        _last_libsql_activity = time.time()
-        try:
-            self._raw_conn().commit()
-        except Exception as e:
-            if self.is_singleton and _is_hrana_stream_error(e):
-                print(f"⚠️ [TURSO] Hrana stream error in commit: {e}. Reconnecting...")
-                _reset_libsql_connection()
-                try:
-                    self._raw_conn().commit()
-                except Exception:
-                    pass
-                return
-            raise
-
-    def rollback(self):
-        try:
-            self._raw_conn().rollback()
-        except Exception:
-            pass
-
-    def close(self):
-        if self.is_singleton:
-            return
-        try:
-            self._conn.close()
-        except Exception:
-            pass
-
-    def __getattr__(self, name):
-        return getattr(self._raw_conn(), name)
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            self.commit()
-        else:
-            self.rollback()
+        self.close()
 
-_libsql_singleton = None
-_libsql_lock = threading.RLock()
-_TURSO_MAX_IDLE_SECONDS = 600  # 10 minutes
-_last_libsql_activity = 0.0
+class PooledConnectionWrapper:
+    """Wrapper managing connection checkout and release back to ConnectionPool."""
+    def __init__(self, raw_conn, pool):
+        self._raw = raw_conn
+        self._pool = pool
+        self._closed = False
 
-def is_turso_configured() -> bool:
-    return bool(os.getenv("TURSO_DATABASE_URL", "").strip())
+    def cursor(self, **kwargs) -> CompatibleCursor:
+        return CompatibleCursor(self._raw.cursor(**kwargs))
 
-def _cleanup_stale_replicas():
-    for stale_path in [
-        Path(os.getenv("TURSO_REPLICA_PATH", "db/nihongo_replica.db")),
-        Path("/tmp/nihongo_replica.db")
-    ]:
-        for ext in ["", "-wal", "-shm"]:
-            f = Path(f"{stale_path}{ext}")
-            if f.exists():
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+    def execute(self, query: str, params=None) -> CompatibleCursor:
+        cur = self.cursor()
+        cur.execute(query, params)
+        return cur
 
-# Cleanup any stale replica files on startup
-_cleanup_stale_replicas()
+    def commit(self):
+        self._raw.commit()
 
-def _get_or_create_libsql_connection():
-    global _libsql_singleton, _last_libsql_activity
-    turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
-    turso_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
-    if not turso_url:
-        return None
+    def rollback(self):
+        self._raw.rollback()
 
-    with _libsql_lock:
-        now = time.time()
-        # Check if idle for >10 minutes
-        if _libsql_singleton is not None and (now - _last_libsql_activity > _TURSO_MAX_IDLE_SECONDS):
-            print(f"⏰ [TURSO] Singleton connection idle for {int(now - _last_libsql_activity)}s (>10m). Recycling connection...")
+    def executescript(self, script: str):
+        with self._raw.cursor() as cur:
+            cur.execute(script)
+        self._raw.commit()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
             try:
-                _libsql_singleton.close()
+                if self._raw.info.transaction_status != TransactionStatus.IDLE:
+                    self._raw.rollback()
+                self._pool.putconn(self._raw)
             except Exception:
                 pass
-            _libsql_singleton = None
 
-        if _libsql_singleton is None:
-            try:
-                import libsql_experimental as libsql
-                _libsql_singleton = libsql.connect(database=turso_url, auth_token=turso_token or None)
-                _last_libsql_activity = time.time()
-                print(f"✅ [TURSO] Connected directly to remote Turso cloud at {turso_url}.")
-            except Exception as e:
-                print(f"⚠️ [TURSO] Failed to connect directly to Turso: {e}. Falling back to local SQLite.")
-                return None
-        else:
-            _last_libsql_activity = now
+    def __del__(self):
+        self.close()
 
-        return _libsql_singleton
+    def __enter__(self):
+        self._raw.__enter__()
+        return self
 
-def _reset_libsql_connection():
-    """Safely closes dead singleton and establishes a fresh connection."""
-    global _libsql_singleton, _last_libsql_activity
-    with _libsql_lock:
-        if _libsql_singleton is not None:
-            try:
-                _libsql_singleton.close()
-            except Exception:
-                pass
-            _libsql_singleton = None
-        return _get_or_create_libsql_connection()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._raw.__exit__(exc_type, exc_val, exc_tb)
 
-def get_connection(db_path: Optional[Path] = None):
-    turso_url = os.getenv("TURSO_DATABASE_URL", "").strip()
-    if turso_url and not db_path:
-        raw = _get_or_create_libsql_connection()
-        if raw is not None:
-            return TursoConnection(raw, is_singleton=True)
-
-    target = db_path or get_db_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    try:
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        conn.execute("PRAGMA journal_mode = WAL;")
-    except Exception:
-        pass
-    return conn
+def get_connection(db_path: Optional[Any] = None) -> PooledConnectionWrapper:
+    pool = get_pool()
+    raw = pool.getconn()
+    return PooledConnectionWrapper(raw, pool)
 
 def migrate_kana_classifications(conn: Optional[Any] = None) -> int:
     """Migrates any multi-character words incorrectly classified as KANA to VOCAB."""
@@ -381,7 +237,7 @@ def migrate_kana_classifications(conn: Optional[Any] = None) -> int:
                 to_update.append(r["id"])
         if to_update:
             for item_id in to_update:
-                cur.execute("UPDATE mastery_items SET item_type = 'VOCAB' WHERE id = ?", (item_id,))
+                cur.execute("UPDATE mastery_items SET item_type = 'VOCAB' WHERE id = %s", (item_id,))
             conn.commit()
             print(f"🧹 [MIGRATION] Reclassified {len(to_update)} multi-character items from KANA to VOCAB.")
         return len(to_update)
@@ -389,15 +245,16 @@ def migrate_kana_classifications(conn: Optional[Any] = None) -> int:
         if close_at_end:
             conn.close()
 
-def init_database(db_path: Optional[Path] = None):
+def init_database(db_path: Optional[Any] = None):
     """Initializes tables using schema.sql and runs essential data migrations."""
-    conn = get_connection(db_path)
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-        schema_sql = f.read()
-    with conn:
+    conn = get_connection()
+    try:
+        with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema_sql = f.read()
         conn.executescript(schema_sql)
-    migrate_kana_classifications(conn)
-    conn.close()
+        migrate_kana_classifications(conn)
+    finally:
+        conn.close()
 
 # --- Notion Sync State ---
 def save_notion_sync(page_id: str, title: str, content_hash: str, raw_markdown: str, last_edited: Optional[str] = None):
@@ -405,20 +262,20 @@ def save_notion_sync(page_id: str, title: str, content_hash: str, raw_markdown: 
     with conn:
         conn.execute("""
             INSERT INTO notion_sync_state (page_id, title, content_hash, raw_markdown, last_edited_time, synced_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             ON CONFLICT(page_id) DO UPDATE SET
                 title = excluded.title,
                 content_hash = excluded.content_hash,
                 raw_markdown = excluded.raw_markdown,
                 last_edited_time = excluded.last_edited_time,
-                synced_at = CURRENT_TIMESTAMP;
+                synced_at = NOW();
         """, (page_id, title, content_hash, raw_markdown, last_edited))
     conn.close()
 
 def get_notion_sync(page_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM notion_sync_state WHERE page_id = ?", (page_id,))
+    cur.execute("SELECT * FROM notion_sync_state WHERE page_id = %s", (page_id,))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -428,7 +285,7 @@ def get_notion_sync(page_id: str) -> Optional[Dict[str, Any]]:
 def get_all_synced_classes() -> List[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT page_id, title, content_hash, last_edited_time, synced_at, length(raw_markdown) as markdown_length FROM notion_sync_state ORDER BY title ASC")
+    cur.execute("SELECT page_id, title, content_hash, last_edited_time, synced_at, LENGTH(raw_markdown) as markdown_length FROM notion_sync_state ORDER BY title ASC")
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -450,43 +307,18 @@ def save_unit(
         close_at_end = True
     try:
         cur = conn.cursor()
-        # Ensure parent row exists in notion_sync_state if notion_page_id is provided
-        if notion_page_id:
-            cur.execute("SELECT 1 FROM notion_sync_state WHERE page_id = ?", (notion_page_id,))
-            if not cur.fetchone():
-                if unit_type.startswith("BOSS") or str(notion_page_id).startswith("boss_"):
-                    cur.execute("""
-                        INSERT INTO notion_sync_state (page_id, title, content_hash, raw_markdown, last_edited_time, synced_at)
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(page_id) DO UPDATE SET
-                            title = excluded.title,
-                            content_hash = excluded.content_hash,
-                            raw_markdown = excluded.raw_markdown,
-                            last_edited_time = excluded.last_edited_time,
-                            synced_at = CURRENT_TIMESTAMP;
-                    """, (
-                        notion_page_id,
-                        f"Synthetic Note: {title}",
-                        content_hash or "boss_milestone",
-                        f"Synthetic Boss Unit parent note for {title}",
-                        datetime.now().isoformat()
-                    ))
-                else:
-                    logger.warning("notion_page_id '%s' not found in notion_sync_state for unit %s. Falling back to NULL.", notion_page_id, unit_number)
-                    notion_page_id = None
-
         cur.execute("""
             INSERT INTO units (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, is_completed, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT(unit_number) DO UPDATE SET
                 unit_type = excluded.unit_type,
                 notion_page_id = excluded.notion_page_id,
                 content_hash = excluded.content_hash,
                 title = excluded.title,
                 lesson_json = excluded.lesson_json,
-                is_completed = MAX(units.is_completed, excluded.is_completed);
-        """, (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, int(is_completed)))
-        cur.execute("SELECT id FROM units WHERE unit_number = ?", (unit_number,))
+                is_completed = (units.is_completed OR excluded.is_completed)
+            RETURNING id;
+        """, (unit_number, unit_type, notion_page_id, content_hash, title, lesson_json, bool(is_completed)))
         row = cur.fetchone()
         unit_id = (row["id"] if isinstance(row, dict) else row[0]) if row else 0
         if close_at_end:
@@ -511,7 +343,7 @@ def get_unit(unit_number: int) -> Optional[Dict[str, Any]]:
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM units WHERE unit_number = ?", (unit_number,))
+    cur.execute("SELECT * FROM units WHERE unit_number = %s", (unit_number,))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -527,7 +359,7 @@ def get_unit(unit_number: int) -> Optional[Dict[str, Any]]:
 def get_unit_by_notion_page_id(page_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM units WHERE notion_page_id = ?", (page_id,))
+    cur.execute("SELECT * FROM units WHERE notion_page_id = %s", (page_id,))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -565,21 +397,21 @@ def upsert_mastery_item(
         close_at_end = True
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM mastery_items WHERE unit_id = ? AND japanese = ?", (unit_id, japanese))
+        cur.execute("SELECT id FROM mastery_items WHERE unit_id = %s AND japanese = %s", (unit_id, japanese))
         row = cur.fetchone()
         if row:
             item_id = row["id"]
             cur.execute("""
                 UPDATE mastery_items SET
-                    item_type = ?,
-                    kana_only = COALESCE(?, kana_only),
-                    romaji = COALESCE(?, romaji),
-                    english = COALESCE(?, english),
-                    marathi = COALESCE(?, marathi),
-                    pronunciation_tip = COALESCE(?, pronunciation_tip),
-                    audio_path = COALESCE(?, audio_path),
-                    svg_markup = COALESCE(?, svg_markup)
-                WHERE id = ?
+                    item_type = %s,
+                    kana_only = COALESCE(%s, kana_only),
+                    romaji = COALESCE(%s, romaji),
+                    english = COALESCE(%s, english),
+                    marathi = COALESCE(%s, marathi),
+                    pronunciation_tip = COALESCE(%s, pronunciation_tip),
+                    audio_path = COALESCE(%s, audio_path),
+                    svg_markup = COALESCE(%s, svg_markup)
+                WHERE id = %s
             """, (item_type, kana_only, romaji, english, marathi, pronunciation_tip, audio_path, svg_markup, item_id))
             if close_at_end:
                 conn.commit()
@@ -633,7 +465,7 @@ def batch_upsert_mastery_items(
 
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, japanese FROM mastery_items WHERE unit_id = ?", (unit_id,))
+        cur.execute("SELECT id, japanese FROM mastery_items WHERE unit_id = %s", (unit_id,))
         existing_map = {}
         for r in cur.fetchall():
             existing_map[r["japanese"]] = r["id"]
@@ -660,15 +492,15 @@ def batch_upsert_mastery_items(
                 item_id = existing_map[japanese]
                 cur.execute("""
                     UPDATE mastery_items SET
-                        item_type = ?,
-                        kana_only = COALESCE(?, kana_only),
-                        romaji = COALESCE(?, romaji),
-                        english = COALESCE(?, english),
-                        marathi = COALESCE(?, marathi),
-                        pronunciation_tip = COALESCE(?, pronunciation_tip),
-                        audio_path = COALESCE(?, audio_path),
-                        svg_markup = COALESCE(?, svg_markup)
-                    WHERE id = ?
+                        item_type = %s,
+                        kana_only = COALESCE(%s, kana_only),
+                        romaji = COALESCE(%s, romaji),
+                        english = COALESCE(%s, english),
+                        marathi = COALESCE(%s, marathi),
+                        pronunciation_tip = COALESCE(%s, pronunciation_tip),
+                        audio_path = COALESCE(%s, audio_path),
+                        svg_markup = COALESCE(%s, svg_markup)
+                    WHERE id = %s
                 """, (item_type, kana_only, romaji, english, marathi, pronunciation_tip, audio_path, svg_markup, item_id))
             else:
                 cur.execute("""
@@ -676,12 +508,14 @@ def batch_upsert_mastery_items(
                         unit_id, item_type, japanese, kana_only, romaji, english, marathi,
                         pronunciation_tip, audio_path, svg_markup, ease_factor, interval_days,
                         repetitions, wrong_count, next_review_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2.5, 1, 0, 0, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 2.5, 1, 0, 0, %s)
+                    RETURNING id;
                 """, (
                     unit_id, item_type, japanese, kana_only, romaji, english, marathi,
                     pronunciation_tip, audio_path, svg_markup, today_str
                 ))
-                new_id = cur.lastrowid
+                res = cur.fetchone()
+                new_id = res["id"] if res else None
                 if new_id:
                     existing_map[japanese] = new_id
             count += 1
@@ -707,7 +541,7 @@ def get_all_units() -> List[Dict[str, Any]]:
 def mark_unit_completed(unit_number: int, is_completed: bool = True):
     conn = get_connection()
     with conn:
-        conn.execute("UPDATE units SET is_completed = ? WHERE unit_number = ?", (int(is_completed), unit_number))
+        conn.execute("UPDATE units SET is_completed = %s WHERE unit_number = %s", (bool(is_completed), unit_number))
     conn.close()
     CACHE.invalidate(f"unit:{unit_number}")
     CACHE.invalidate_prefix("roadmap:")
@@ -743,13 +577,15 @@ def save_mastery_item(
                 unit_id, item_type, japanese, kana_only, romaji, english, marathi,
                 pronunciation_tip, audio_path, svg_markup, ease_factor, interval_days,
                 repetitions, wrong_count, next_review_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id;
         """, (
             unit_id, item_type, japanese, kana_only, romaji, english, marathi,
             pronunciation_tip, audio_path, svg_markup, ease_factor, interval_days,
             repetitions, wrong_count, rev_date
         ))
-        item_id = cur.lastrowid
+        row = cur.fetchone()
+        item_id = row["id"] if row else None
         if close_at_end:
             conn.commit()
         CACHE.invalidate_prefix("bank:")
@@ -765,9 +601,9 @@ def get_due_mastery_items(limit: int = 6) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute("""
         SELECT * FROM mastery_items
-        WHERE next_review_date <= date('now') OR wrong_count > 0
+        WHERE next_review_date <= CURRENT_DATE OR wrong_count > 0
         ORDER BY wrong_count DESC, next_review_date ASC
-        LIMIT ?
+        LIMIT %s
     """, (limit,))
     rows = cur.fetchall()
     conn.close()
@@ -785,15 +621,15 @@ def update_mastery_srs(
     with conn:
         conn.execute("""
             UPDATE mastery_items
-            SET ease_factor = ?, interval_days = ?, repetitions = ?, wrong_count = ?, next_review_date = ?
-            WHERE id = ?
+            SET ease_factor = %s, interval_days = %s, repetitions = %s, wrong_count = %s, next_review_date = %s
+            WHERE id = %s
         """, (ease_factor, interval_days, repetitions, wrong_count, next_review_date, item_id))
     conn.close()
 
 def get_mastery_items_for_unit(unit_id: int) -> List[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM mastery_items WHERE unit_id = ?", (unit_id,))
+    cur.execute("SELECT * FROM mastery_items WHERE unit_id = %s", (unit_id,))
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -802,18 +638,18 @@ def get_mastery_items_for_unit(unit_id: int) -> List[Dict[str, Any]]:
 def get_kaggle_audio(transcript: str) -> Optional[str]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT file_path FROM kaggle_audio WHERE transcript = ?", (transcript.strip(),))
+    cur.execute("SELECT file_path FROM kaggle_audio WHERE transcript = %s", (transcript.strip(),))
     row = cur.fetchone()
     conn.close()
     if row:
-        return row[0]
+        return row["file_path"] if isinstance(row, dict) else row[0]
     return None
 
 def save_kaggle_audio(transcript: str, file_path: str):
     conn = get_connection()
     with conn:
         conn.execute("""
-            INSERT INTO kaggle_audio (transcript, file_path) VALUES (?, ?)
+            INSERT INTO kaggle_audio (transcript, file_path) VALUES (%s, %s)
             ON CONFLICT(transcript) DO UPDATE SET file_path = excluded.file_path
         """, (transcript.strip(), file_path))
     conn.close()
@@ -822,18 +658,18 @@ def save_kaggle_audio(transcript: str, file_path: str):
 def get_cached_svg(keyword: str) -> Optional[str]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT svg_markup FROM svg_cache WHERE keyword = ?", (keyword.strip().lower(),))
+    cur.execute("SELECT svg_markup FROM svg_cache WHERE keyword = %s", (keyword.strip().lower(),))
     row = cur.fetchone()
     conn.close()
     if row:
-        return row[0]
+        return row["svg_markup"] if isinstance(row, dict) else row[0]
     return None
 
 def save_cached_svg(keyword: str, svg_markup: str):
     conn = get_connection()
     with conn:
         conn.execute("""
-            INSERT INTO svg_cache (keyword, svg_markup) VALUES (?, ?)
+            INSERT INTO svg_cache (keyword, svg_markup) VALUES (%s, %s)
             ON CONFLICT(keyword) DO UPDATE SET svg_markup = excluded.svg_markup
         """, (keyword.strip().lower(), svg_markup))
     conn.close()
@@ -842,8 +678,9 @@ def save_cached_svg(keyword: str, svg_markup: str):
 def get_users_count() -> int:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) as count FROM users")
+    row = cur.fetchone()
+    count = row["count"] if row else 0
     conn.close()
     return count
 
@@ -858,7 +695,7 @@ def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (clean_email,))
+    cur.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(%s)", (clean_email,))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -875,7 +712,7 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -897,9 +734,11 @@ def create_user(
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO users (email, name, password_hash, auth_provider, role, avatar_url, xp, streak)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+            VALUES (%s, %s, %s, %s, %s, %s, 0, 0)
+            RETURNING id;
         """, (email.strip().lower(), name.strip(), password_hash, auth_provider, role, avatar_url))
-        user_id = cur.lastrowid
+        row = cur.fetchone()
+        user_id = row["id"] if row else None
     conn.close()
     CACHE.invalidate_prefix("user:")
     return get_user_by_id(user_id)
@@ -910,9 +749,9 @@ def upsert_google_user(email: str, name: str, avatar_url: Optional[str] = None, 
         conn = get_connection()
         with conn:
             conn.execute("""
-                UPDATE users SET name = COALESCE(?, name), avatar_url = COALESCE(?, avatar_url),
-                                 role = CASE WHEN ? = 'admin' THEN 'admin' ELSE role END
-                WHERE id = ?
+                UPDATE users SET name = COALESCE(%s, name), avatar_url = COALESCE(%s, avatar_url),
+                                 role = CASE WHEN %s = 'admin' THEN 'admin' ELSE role END
+                WHERE id = %s
             """, (name, avatar_url, default_role, existing["id"]))
         conn.close()
         CACHE.invalidate_prefix("user:")
@@ -930,9 +769,9 @@ def update_user_stats(user_id: int, xp_delta: int = 0, streak: Optional[int] = N
     conn = get_connection()
     with conn:
         if streak is not None:
-            conn.execute("UPDATE users SET xp = MAX(0, xp + ?), streak = MAX(?, 1) WHERE id = ?", (xp_delta, streak, user_id))
+            conn.execute("UPDATE users SET xp = GREATEST(0, xp + %s), streak = GREATEST(%s, 1) WHERE id = %s", (xp_delta, streak, user_id))
         else:
-            conn.execute("UPDATE users SET xp = MAX(0, xp + ?), streak = MAX(COALESCE(streak, 0), 1) WHERE id = ?", (xp_delta, user_id))
+            conn.execute("UPDATE users SET xp = GREATEST(0, xp + %s), streak = GREATEST(COALESCE(streak, 0), 1) WHERE id = %s", (xp_delta, user_id))
     conn.close()
     CACHE.invalidate(f"user:id:{user_id}")
 
@@ -947,10 +786,10 @@ def get_user_roadmap(user_id: int) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute("""
         SELECT u.id, u.unit_number, u.unit_type, u.title, u.created_at,
-               COALESCE(p.is_completed, 0) as is_completed,
+               COALESCE(p.is_completed, FALSE) as is_completed,
                COALESCE(p.best_accuracy, 0) as best_accuracy
         FROM units u
-        LEFT JOIN user_unit_progress p ON u.unit_number = p.unit_number AND p.user_id = ?
+        LEFT JOIN user_unit_progress p ON u.unit_number = p.unit_number AND p.user_id = %s
         ORDER BY u.unit_number ASC
     """, (user_id,))
     rows = cur.fetchall()
@@ -964,12 +803,12 @@ def mark_user_unit_completed(user_id: int, unit_number: int, is_completed: bool 
     with conn:
         conn.execute("""
             INSERT INTO user_unit_progress (user_id, unit_number, is_completed, best_accuracy, completed_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, NOW())
             ON CONFLICT(user_id, unit_number) DO UPDATE SET
-                is_completed = MAX(user_unit_progress.is_completed, excluded.is_completed),
-                best_accuracy = MAX(user_unit_progress.best_accuracy, excluded.best_accuracy),
-                completed_at = CURRENT_TIMESTAMP
-        """, (user_id, unit_number, int(is_completed), float(accuracy)))
+                is_completed = (user_unit_progress.is_completed OR excluded.is_completed),
+                best_accuracy = GREATEST(user_unit_progress.best_accuracy, excluded.best_accuracy),
+                completed_at = NOW()
+        """, (user_id, unit_number, bool(is_completed), float(accuracy)))
     conn.close()
     CACHE.invalidate(f"roadmap:{user_id}")
 
@@ -977,7 +816,7 @@ def mark_user_unit_completed(user_id: int, unit_number: int, is_completed: bool 
 def get_user_mastery_item(user_id: int, item_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM user_mastery WHERE user_id = ? AND item_id = ?", (user_id, item_id))
+    cur.execute("SELECT * FROM user_mastery WHERE user_id = %s AND item_id = %s", (user_id, item_id))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -998,7 +837,7 @@ def save_user_mastery(
         conn.execute("""
             INSERT INTO user_mastery (
                 user_id, item_id, ease_factor, interval_days, repetitions, wrong_count, next_review_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT(user_id, item_id) DO UPDATE SET
                 ease_factor = excluded.ease_factor,
                 interval_days = excluded.interval_days,
@@ -1042,7 +881,7 @@ def batch_submit_progress(
     - Resolves all submitted item IDs in a single query.
     - Fetches all current mastery states in a single query.
     - Computes updated SM-2 parameters in Python memory.
-    - Writes all user_mastery updates using a single multi-row INSERT ... ON CONFLICT statement (1 round-trip on Turso/Hrana).
+    - Writes all user_mastery updates using a single multi-row INSERT ... ON CONFLICT statement (1 round-trip).
     - Upserts unit completion and updates user stats/streak in the same transaction.
     - Commits once at the end.
     - Only checks boss milestone if is_completed and unit_number % 5 == 0.
@@ -1071,13 +910,13 @@ def batch_submit_progress(
         text_to_real_id: Dict[str, int] = {}
 
         if raw_ids:
-            ph = ", ".join(["?"] * len(raw_ids))
+            ph = ", ".join(["%s"] * len(raw_ids))
             cur.execute(f"SELECT id FROM mastery_items WHERE id IN ({ph})", tuple(raw_ids))
             for row in cur.fetchall():
                 id_to_real_id[row["id"]] = row["id"]
 
         if text_targets:
-            ph = ", ".join(["?"] * len(text_targets))
+            ph = ", ".join(["%s"] * len(text_targets))
             cur.execute(
                 f"SELECT id, japanese, kana_only FROM mastery_items WHERE japanese IN ({ph}) OR kana_only IN ({ph})",
                 tuple(text_targets) + tuple(text_targets),
@@ -1112,9 +951,9 @@ def batch_submit_progress(
         # 2. Batch fetch existing user_mastery
         curr_mastery: Dict[int, Dict[str, Any]] = {}
         if resolved_ids:
-            ph = ", ".join(["?"] * len(resolved_ids))
+            ph = ", ".join(["%s"] * len(resolved_ids))
             cur.execute(
-                f"SELECT item_id, ease_factor, interval_days, repetitions, wrong_count FROM user_mastery WHERE user_id = ? AND item_id IN ({ph})",
+                f"SELECT item_id, ease_factor, interval_days, repetitions, wrong_count FROM user_mastery WHERE user_id = %s AND item_id IN ({ph})",
                 (user_id, *resolved_ids),
             )
             for row in cur.fetchall():
@@ -1144,7 +983,7 @@ def batch_submit_progress(
         # 4. Multi-Row INSERT INTO user_mastery (Single network round-trip for all items)
         if mastery_rows:
             rows_to_insert = list(mastery_rows.values())
-            values_clause = ", ".join(["(?, ?, ?, ?, ?, ?, ?)"] * len(rows_to_insert))
+            values_clause = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * len(rows_to_insert))
             flattened_params = [val for row in rows_to_insert for val in row]
             cur.execute(f"""
                 INSERT INTO user_mastery (
@@ -1162,33 +1001,22 @@ def batch_submit_progress(
         if is_completed:
             cur.execute("""
                 INSERT INTO user_unit_progress (user_id, unit_number, is_completed, best_accuracy, completed_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, %s, %s, NOW())
                 ON CONFLICT(user_id, unit_number) DO UPDATE SET
-                    is_completed = MAX(user_unit_progress.is_completed, excluded.is_completed),
-                    best_accuracy = MAX(user_unit_progress.best_accuracy, excluded.best_accuracy),
-                    completed_at = CURRENT_TIMESTAMP
-            """, (user_id, int(unit_number), 1, float(accuracy)))
+                    is_completed = (user_unit_progress.is_completed OR excluded.is_completed),
+                    best_accuracy = GREATEST(user_unit_progress.best_accuracy, excluded.best_accuracy),
+                    completed_at = NOW()
+            """, (user_id, int(unit_number), True, float(accuracy)))
 
-        # 6. Update user XP and streak in the same query via RETURNING (reduces total queries to <= 5)
-        try:
-            cur.execute("""
-                UPDATE users
-                SET xp = MAX(0, xp + ?),
-                    streak = CASE WHEN ? = 1 THEN MAX(COALESCE(streak, 0) + 1, 1) ELSE MAX(COALESCE(streak, 0), 1) END
-                WHERE id = ?
-                RETURNING xp, streak
-            """, (earned_xp, 1 if is_completed else 0, user_id))
-            user_row = cur.fetchone()
-        except Exception:
-            # Fallback for environments without RETURNING support
-            cur.execute("""
-                UPDATE users
-                SET xp = MAX(0, xp + ?),
-                    streak = CASE WHEN ? = 1 THEN MAX(COALESCE(streak, 0) + 1, 1) ELSE MAX(COALESCE(streak, 0), 1) END
-                WHERE id = ?
-            """, (earned_xp, 1 if is_completed else 0, user_id))
-            cur.execute("SELECT xp, streak FROM users WHERE id = ?", (user_id,))
-            user_row = cur.fetchone()
+        # 6. Update user XP and streak in the same query via RETURNING
+        cur.execute("""
+            UPDATE users
+            SET xp = GREATEST(0, xp + %s),
+                streak = CASE WHEN %s = 1 THEN GREATEST(COALESCE(streak, 0) + 1, 1) ELSE GREATEST(COALESCE(streak, 0), 1) END
+            WHERE id = %s
+            RETURNING xp, streak
+        """, (earned_xp, 1 if is_completed else 0, user_id))
+        user_row = cur.fetchone()
 
         new_xp = user_row["xp"] if user_row else 0
         curr_streak = user_row["streak"] if user_row else 1
@@ -1246,13 +1074,13 @@ def get_user_due_mastery_items(user_id: int, limit: int = 30) -> List[Dict[str, 
                COALESCE(um.interval_days, 1) as interval_days,
                COALESCE(um.repetitions, 0) as repetitions,
                COALESCE(um.wrong_count, 0) as wrong_count,
-               COALESCE(um.next_review_date, date('now')) as next_review_date
+               COALESCE(um.next_review_date, CURRENT_DATE) as next_review_date
         FROM mastery_items m
         JOIN units u ON m.unit_id = u.id
-        LEFT JOIN user_mastery um ON m.id = um.item_id AND um.user_id = ?
-        WHERE (um.next_review_date <= date('now') OR um.wrong_count > 0 OR um.user_id IS NULL)
-        ORDER BY COALESCE(um.wrong_count, 0) DESC, COALESCE(um.next_review_date, date('now')) ASC
-        LIMIT ?
+        LEFT JOIN user_mastery um ON m.id = um.item_id AND um.user_id = %s
+        WHERE (um.next_review_date <= CURRENT_DATE OR um.wrong_count > 0 OR um.user_id IS NULL)
+        ORDER BY COALESCE(um.wrong_count, 0) DESC, COALESCE(um.next_review_date, CURRENT_DATE) ASC
+        LIMIT %s
     """, (user_id, limit))
     rows = cur.fetchall()
     conn.close()
@@ -1274,10 +1102,10 @@ def get_user_bank_items(user_id: int) -> List[Dict[str, Any]]:
                COALESCE(um.wrong_count, 0) as wrong_count,
                COALESCE(um.ease_factor, 2.5) as ease_factor,
                COALESCE(um.interval_days, 1) as interval_days,
-               COALESCE(um.next_review_date, date('now')) as next_review_date
+               COALESCE(um.next_review_date, CURRENT_DATE) as next_review_date
         FROM mastery_items m
         JOIN units u ON m.unit_id = u.id
-        LEFT JOIN user_mastery um ON m.id = um.item_id AND um.user_id = ?
+        LEFT JOIN user_mastery um ON m.id = um.item_id AND um.user_id = %s
         ORDER BY u.unit_number ASC, m.id ASC
     """, (user_id,))
     rows = cur.fetchall()
@@ -1301,9 +1129,11 @@ def save_live_session(
         cur.execute("""
             INSERT INTO live_sessions (
                 user_id, unit_focus, duration_seconds, summary_json, transcript_json, whiteboard_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            RETURNING id;
         """, (user_id, unit_focus, duration_seconds, summary_json, transcript_json, whiteboard_json))
-        session_id = cur.lastrowid
+        row = cur.fetchone()
+        session_id = row["id"] if row else None
     conn.close()
     return session_id
 
@@ -1311,7 +1141,7 @@ def update_live_session_summary(session_id: int, summary_json: str) -> bool:
     conn = get_connection()
     with conn:
         cur = conn.cursor()
-        cur.execute("UPDATE live_sessions SET summary_json = ? WHERE id = ?", (summary_json, session_id))
+        cur.execute("UPDATE live_sessions SET summary_json = %s WHERE id = %s", (summary_json, session_id))
         updated = cur.rowcount > 0
     conn.close()
     return updated
@@ -1322,16 +1152,15 @@ def get_user_live_sessions(user_id: int, limit: int = 20) -> List[Dict[str, Any]
     cur.execute("""
         SELECT id, user_id, unit_focus, duration_seconds, summary_json, transcript_json, whiteboard_json, created_at
         FROM live_sessions
-        WHERE user_id = ?
+        WHERE user_id = %s
         ORDER BY created_at DESC, id DESC
-        LIMIT ?
+        LIMIT %s
     """, (user_id, limit))
     rows = cur.fetchall()
     conn.close()
     results = []
     for r in rows:
         d = dict(r)
-        # Parse JSON fields for convenience
         try:
             d["summary"] = json.loads(d["summary_json"]) if d["summary_json"] else None
         except Exception:
@@ -1353,9 +1182,9 @@ def get_user_recent_live_session_summaries(user_id: int, limit: int = 3) -> List
     cur.execute("""
         SELECT id, unit_focus, duration_seconds, summary_json, created_at
         FROM live_sessions
-        WHERE user_id = ? AND summary_json IS NOT NULL
+        WHERE user_id = %s AND summary_json IS NOT NULL
         ORDER BY created_at DESC, id DESC
-        LIMIT ?
+        LIMIT %s
     """, (user_id, limit))
     rows = cur.fetchall()
     conn.close()
@@ -1376,7 +1205,7 @@ def get_notion_page_sync_state(page_id: str) -> Optional[Dict[str, Any]]:
     clean_id = page_id.replace("-", "")
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT page_id, last_edited_time, last_synced_at FROM notion_page_sync_state WHERE page_id = ?", (clean_id,))
+    cur.execute("SELECT page_id, last_edited_time, last_synced_at FROM notion_page_sync_state WHERE page_id = %s", (clean_id,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -1397,15 +1226,17 @@ def upsert_notion_page_sync_state(page_id: str, last_edited_time: str):
     with conn:
         conn.execute("""
             INSERT INTO notion_page_sync_state (page_id, last_edited_time, last_synced_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, NOW())
             ON CONFLICT(page_id) DO UPDATE SET
                 last_edited_time = excluded.last_edited_time,
-                last_synced_at = CURRENT_TIMESTAMP
+                last_synced_at = NOW()
         """, (clean_id, last_edited_time))
     conn.close()
 
+def is_turso_configured() -> bool:
+    """Legacy helper: Turso has been migrated to Neon PostgreSQL."""
+    return False
+
 if __name__ == "__main__":
     init_database()
-    print(f"✅ Database initialized with updated schema at: {get_db_path()}")
-
-
+    print("✅ Neon PostgreSQL database initialized with updated schema.")
