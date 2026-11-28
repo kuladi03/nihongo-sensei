@@ -249,24 +249,43 @@ export function AppProvider({ children }) {
     return (bankItems || []).filter(item => (item.item_type || '').toUpperCase() !== 'KANA').length;
   }, [bankItems]);
 
-  const learnedKanaCount = useMemo(() => {
-    const uniqueKana = new Set();
+  const GOJUON_HIRAGANA_SET = useMemo(() => new Set([
+    'あ','い','う','え','お',
+    'か','き','く','け','こ',
+    'さ','し','す','せ','そ',
+    'た','ち','つ','て','と',
+    'な','に','ぬ','ね','の',
+    'は','ひ','ふ','へ','ほ',
+    'ま','み','む','め','も',
+    'や','ゆ','よ',
+    'ら','り','る','れ','ろ',
+    'わ','を','ん'
+  ]), []);
+
+  const { learnedKanaCount, totalLearnedKanaCount } = useMemo(() => {
+    const uniqueGojuon = new Set();
+    const allUniqueKana = new Set();
     const SMALL_KANA = new Set(['ぁ','ぃ','ぅ','ぇ','ぉ','っ','ゃ','ゅ','ょ','ゎ']);
 
     (bankItems || []).forEach(item => {
       if ((item.item_type || '').toUpperCase() !== 'KANA') return;
       const text = (item.japanese || item.kana_only || '').trim();
-      // Strictly filter to single Hiragana character OR valid 2-char yōon combination
       const isSingleKana = text.length === 1 && /^[\u3040-\u309F]$/.test(text);
       const isYoonKana = text.length === 2 && /^[\u3040-\u309F]$/.test(text[0]) && SMALL_KANA.has(text[1]);
 
       if (isSingleKana || isYoonKana) {
-        uniqueKana.add(text);
+        allUniqueKana.add(text);
+        if (GOJUON_HIRAGANA_SET.has(text)) {
+          uniqueGojuon.add(text);
+        }
       }
     });
 
-    return uniqueKana.size;
-  }, [bankItems]);
+    return {
+      learnedKanaCount: Math.min(46, uniqueGojuon.size),
+      totalLearnedKanaCount: allUniqueKana.size,
+    };
+  }, [bankItems, GOJUON_HIRAGANA_SET]);
 
   // Global Keyboard Shortcuts (Guard: Do NOT trigger when typing in inputs/textareas)
   useEffect(() => {
@@ -508,6 +527,7 @@ export function AppProvider({ children }) {
         bankItems,
         vocabCount,
         learnedKanaCount,
+        totalLearnedKanaCount,
         bankLoading,
         loading,
         syncing,

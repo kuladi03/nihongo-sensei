@@ -195,7 +195,7 @@ export default function BankView() {
               { id: 'VOCAB', label: 'Vocab' },
               { id: 'PHRASE', label: 'Phrases & Greetings' },
               { id: 'GRAMMAR', label: 'Grammar' },
-              { id: 'TRAP', label: '⚠️ Traps Only' },
+              { id: 'TRAP', label: 'Phonetic Traps' },
             ].map((f) => (
               <button
                 key={f.id}
@@ -283,11 +283,6 @@ export default function BankView() {
                       size="xl"
                       align="left"
                     />
-                    {item.kana_only && item.kana_only !== item.japanese && (
-                      <div className="text-xs font-semibold text-[#4A7C59] font-japanese mt-0.5">
-                        {item.kana_only}
-                      </div>
-                    )}
                   </div>
 
                   {/* Meanings */}
@@ -296,7 +291,7 @@ export default function BankView() {
                       {item.english || item.english_meaning}
                     </div>
                     {(item.marathi || item.marathi_meaning) && (
-                      <div className="text-xs font-medium text-[#233E2B] font-marathi">
+                      <div className="text-xs font-semibold text-[#233E2B] font-marathi tracking-wide leading-relaxed">
                         मराठी: {item.marathi || item.marathi_meaning}
                       </div>
                     )}
@@ -304,11 +299,11 @@ export default function BankView() {
 
                   {/* Phonetic Trap Alert Banner */}
                   {hasTrap && (
-                    <div className="mt-3 p-2.5 rounded-2xl bg-[#FDF2EF] border border-[#F5C6BC] text-xs">
-                      <div className="flex items-center gap-1 text-[11px] font-bold text-[#9A2E1A] uppercase tracking-wider mb-0.5">
+                    <div className="mt-3 p-3 rounded-2xl bg-[#FDF2EF] border border-[#F5C6BC] text-xs">
+                      <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#9A2E1A] uppercase tracking-wider mb-1">
                         <AlertTriangle size={13} className="text-[#D94E34]" /> Phonetic Trap
                       </div>
-                      <p className="text-[11px] text-[#9A2E1A] font-sans font-medium leading-relaxed">
+                      <p className="text-xs text-[#9A2E1A] font-marathi font-medium leading-relaxed">
                         {item.trap_note || item.phonetic_trap || item.pronunciation_tip}
                       </p>
                     </div>

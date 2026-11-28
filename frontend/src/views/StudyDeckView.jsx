@@ -1,18 +1,79 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import JpText from '../components/JpText';
 import SvgIcon from '../components/SvgIcon';
 import AudioButton from '../components/AudioButton';
-import { ChevronLeft, ChevronRight, Play, AlertTriangle, ArrowLeft } from 'lucide-react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  Play,
+  AlertTriangle,
+  ArrowLeft,
+  Eye,
+  CheckCircle2,
+  Sparkles,
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 export default function StudyDeckView() {
   const { activeUnit, setActiveView, openUnit } = useApp();
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [revealedSet, setRevealedSet] = useState(() => new Set());
+  const [justRevealed, setJustRevealed] = useState(false);
 
   const cards = activeUnit?.study_cards || [];
   const currentCard = cards[currentIndex] || {};
   const totalCards = cards.length;
+  const isRevealed = revealedSet.has(currentIndex);
+
+  const goNext = () => {
+    if (!isRevealed) {
+      // Prevent effortless skipping: auto-reveal on first attempt
+      revealCurrent();
+      return;
+    }
+    if (currentIndex < totalCards - 1) {
+      setCurrentIndex(prev => prev + 1);
+    }
+  };
+
+  const goPrev = () => {
+    if (currentIndex > 0) {
+      setCurrentIndex(prev => prev - 1);
+    }
+  };
+
+  const revealCurrent = () => {
+    setRevealedSet(prev => new Set(prev).add(currentIndex));
+    setJustRevealed(true);
+    setTimeout(() => setJustRevealed(false), 500);
+  };
+
+  // Keyboard navigation & space-to-reveal
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      const tag = (e.target?.tagName || '').toUpperCase();
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) || e.target?.isContentEditable) return;
+
+      if (e.code === 'Space' || e.code === 'Enter') {
+        e.preventDefault();
+        if (!isRevealed) {
+          revealCurrent();
+        } else if (currentIndex < totalCards - 1) {
+          goNext();
+        }
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        goNext();
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        goPrev();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isRevealed, currentIndex, totalCards]);
 
   if (totalCards === 0) {
     return (
@@ -28,17 +89,12 @@ export default function StudyDeckView() {
     );
   }
 
-  const goNext = () => {
-    if (currentIndex < totalCards - 1) {
-      setCurrentIndex(prev => prev + 1);
-    }
-  };
+  // Clean Japanese text: strip nested parenthetical kana so JpText doesn't repeat it
+  const cleanJapanese = String(currentCard.japanese || currentCard.kana_only || '')
+    .replace(/\s*[\(（][\u3040-\u309f\s・]+[\)）]/g, '')
+    .trim();
 
-  const goPrev = () => {
-    if (currentIndex > 0) {
-      setCurrentIndex(prev => prev - 1);
-    }
-  };
+  const trapText = currentCard.pronunciation_tip || currentCard.trap_note || currentCard.phonetic_trap;
 
   return (
     <div className="max-w-xl mx-auto py-8 px-4 flex flex-col min-h-[85vh] justify-between">
@@ -59,61 +115,72 @@ export default function StudyDeckView() {
           </div>
         </div>
 
-        {/* Progress Bar */}
+        {/* Animated Progress Bar */}
         <div className="w-full h-2 bg-[#F5F3EF] rounded-full overflow-hidden border border-[#E5E0D8] mb-6">
-          <div
-            className="h-full bg-gradient-to-r from-[#2B4C7E] to-[#4A7C59] transition-all duration-300 rounded-full"
-            style={{ width: `${((currentIndex + 1) / totalCards) * 100}%` }}
+          <motion.div
+            className="h-full bg-gradient-to-r from-[#2B4C7E] via-[#4A7C59] to-emerald-400 rounded-full"
+            initial={false}
+            animate={{ width: `${((currentIndex + 1) / totalCards) * 100}%` }}
+            transition={{ type: "spring", stiffness: 300, damping: 30 }}
           />
         </div>
       </div>
 
-      {/* Main Study Card */}
+      {/* Main Interactive Study Card */}
       <div className="my-auto">
         <AnimatePresence mode="wait">
           <motion.div
             key={currentIndex}
-            initial={{ opacity: 0, scale: 0.97, x: 20 }}
-            animate={{ opacity: 1, scale: 1, x: 0 }}
-            exit={{ opacity: 0, scale: 0.97, x: -20 }}
-            transition={{ duration: 0.2 }}
-            className="relative bg-white border border-[#E5E0D8] rounded-3xl p-6 sm:p-8 shadow-sm flex flex-col items-center text-center overflow-hidden"
+            initial={{ opacity: 0, scale: 0.96, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: -12 }}
+            transition={{ type: "spring", stiffness: 320, damping: 28 }}
+            className={`relative bg-white border rounded-3xl p-6 sm:p-8 shadow-sm flex flex-col items-center text-center overflow-hidden transition-colors ${
+              justRevealed ? 'border-[#4A7C59] ring-2 ring-[#4A7C59]/20' : 'border-[#E5E0D8]'
+            }`}
           >
-            {/* Top Category Tag & SVG/Stamp Icon */}
-            <div className="w-full flex items-center justify-between mb-6">
+            {/* Top Category Tag & Contextual Seal/SVG Icon */}
+            <div className="w-full flex items-center justify-between mb-5">
               <span className="px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-[#F5F3EF] text-[#2B4C7E] border border-[#E5E0D8]">
                 {currentCard.item_type || 'VOCAB'}
               </span>
 
-              {/* Styled Kana Stamp or Sized SVG */}
-              <div className="w-14 h-14 p-1.5 rounded-2xl bg-[#F5F3EF] border border-[#E5E0D8] flex items-center justify-center shadow-xs">
-                <SvgIcon
-                  svgMarkup={currentCard.svg_markup}
-                  itemType={currentCard.item_type}
-                  japanese={currentCard.japanese}
-                  kanaOnly={currentCard.kana_only}
-                  className="w-11 h-11"
-                />
+              {/* Status Badge */}
+              <div className="flex items-center gap-2">
+                {isRevealed && (
+                  <motion.span
+                    initial={{ opacity: 0, scale: 0.8 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#EDF5EF] text-[#233E2B] border border-[#C5DEC9]"
+                  >
+                    <CheckCircle2 size={11} className="text-[#4A7C59]" /> Reviewed
+                  </motion.span>
+                )}
+                {/* Styled Kana Stamp or Sized Hanko SVG */}
+                <div className="w-14 h-14 p-1.5 rounded-2xl bg-[#F5F3EF] border border-[#E5E0D8] flex items-center justify-center shadow-xs">
+                  <SvgIcon
+                    svgMarkup={currentCard.svg_markup}
+                    itemType={currentCard.item_type}
+                    japanese={cleanJapanese}
+                    kanaOnly={currentCard.kana_only}
+                    className="w-11 h-11"
+                  />
+                </div>
               </div>
             </div>
 
-            {/* Main Japanese Script + Romaji via JpText */}
-            <div className="my-3">
+            {/* Main Japanese Script (Clean Furigana & Romaji without duplicate kana sub-lines) */}
+            <div className="my-4">
               <JpText
-                japanese={currentCard.japanese || currentCard.kana_only}
+                japanese={cleanJapanese}
                 romaji={currentCard.romaji}
                 kana={currentCard.kana_only}
                 size="3xl"
               />
-              {currentCard.kana_only && currentCard.kana_only !== currentCard.japanese && (
-                <div className="text-base font-bold text-[#4A7C59] font-japanese mt-1">
-                  {currentCard.kana_only}
-                </div>
-              )}
             </div>
 
             {/* Audio Button with Slow Toggle */}
-            <div className="mt-4 mb-6">
+            <div className="mt-2 mb-4">
               <AudioButton
                 audioPath={currentCard.audio_path}
                 size="lg"
@@ -122,31 +189,66 @@ export default function StudyDeckView() {
               />
             </div>
 
-            {/* Meaning Section: English & Marathi */}
-            <div className="w-full pt-4 border-t border-[#E5E0D8] space-y-1.5">
-              <div className="text-xl font-bold text-stone-900">
-                {currentCard.english || currentCard.english_meaning}
-              </div>
-              {(currentCard.marathi || currentCard.marathi_meaning) && (
-                <div className="text-sm font-semibold text-[#233E2B] font-marathi">
-                  मराठी: {currentCard.marathi || currentCard.marathi_meaning}
+            {/* Engagement Pacing: Reveal State vs Hidden Prompt */}
+            {!isRevealed ? (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="w-full pt-4 border-t border-[#E5E0D8] flex flex-col items-center"
+              >
+                <button
+                  type="button"
+                  onClick={revealCurrent}
+                  className="w-full py-3.5 px-4 rounded-2xl bg-gradient-to-r from-[#2B4C7E] to-[#1E3A63] hover:from-[#1E3A63] hover:to-[#162B4A] text-white font-bold text-sm shadow-md hover:shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2 group cursor-pointer"
+                >
+                  <Eye size={18} className="group-hover:scale-110 transition-transform" />
+                  <span>Reveal Meaning & Marathi Nuance</span>
+                  <span className="hidden sm:inline text-xs font-mono opacity-60 ml-1 px-1.5 py-0.5 rounded bg-white/10">
+                    Space
+                  </span>
+                </button>
+                <p className="text-[11px] text-stone-600 mt-2 font-medium">
+                  Test your recall first before unlocking the full meaning breakdown.
+                </p>
+              </motion.div>
+            ) : (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.25 }}
+                className="w-full pt-4 border-t border-[#E5E0D8] space-y-3"
+              >
+                {/* Meaning Section: English & Marathi */}
+                <div className="space-y-1.5">
+                  <div className="text-xl font-black text-stone-900 tracking-tight">
+                    {currentCard.english || currentCard.english_meaning}
+                  </div>
+                  {(currentCard.marathi || currentCard.marathi_meaning) && (
+                    <div className="text-sm font-semibold text-[#233E2B] font-marathi tracking-wide leading-relaxed">
+                      मराठी: {currentCard.marathi || currentCard.marathi_meaning}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
 
-            {/* Phonetic Trap Banner (High contrast Vermilion) */}
-            {(currentCard.pronunciation_tip || currentCard.trap_note || currentCard.phonetic_trap) && (
-              <div className="w-full mt-5 p-3.5 rounded-2xl bg-[#FDF2EF] border border-[#F5C6BC] text-left flex items-start gap-3">
-                <AlertTriangle size={18} className="text-[#D94E34] flex-shrink-0 mt-0.5" />
-                <div>
-                  <div className="text-xs font-bold text-[#9A2E1A] uppercase tracking-wider mb-0.5">
-                    Phonetic Nuance & Trap Alert
-                  </div>
-                  <div className="text-xs text-[#9A2E1A] font-medium leading-relaxed font-marathi">
-                    {currentCard.pronunciation_tip || currentCard.trap_note || currentCard.phonetic_trap}
-                  </div>
-                </div>
-              </div>
+                {/* Phonetic Trap Banner (High contrast Vermilion with enhanced spacing) */}
+                {trapText && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.97 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="w-full mt-4 p-3.5 rounded-2xl bg-[#FDF2EF] border border-[#F5C6BC] text-left flex items-start gap-3 shadow-xs"
+                  >
+                    <AlertTriangle size={18} className="text-[#D94E34] flex-shrink-0 mt-0.5" />
+                    <div>
+                      <div className="text-xs font-bold text-[#9A2E1A] uppercase tracking-wider mb-1">
+                        Phonetic Nuance & Marathi Trap Alert
+                      </div>
+                      <div className="text-xs text-[#9A2E1A] font-medium leading-relaxed font-marathi">
+                        {trapText}
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </motion.div>
             )}
           </motion.div>
         </AnimatePresence>
@@ -158,7 +260,7 @@ export default function StudyDeckView() {
           type="button"
           onClick={goPrev}
           disabled={currentIndex === 0}
-          className="flex items-center gap-1.5 px-4 py-3 rounded-2xl bg-white hover:bg-[#F5F3EF] disabled:opacity-40 text-stone-700 font-bold border border-[#E5E0D8] shadow-xs transition-colors"
+          className="flex items-center gap-1.5 px-4 py-3 rounded-2xl bg-white hover:bg-[#F5F3EF] disabled:opacity-40 text-stone-700 font-bold border border-[#E5E0D8] shadow-xs transition-colors cursor-pointer"
         >
           <ChevronLeft size={18} /> Prev
         </button>
@@ -172,7 +274,7 @@ export default function StudyDeckView() {
               setActiveView('exercises');
             }
           }}
-          className="flex items-center gap-2 px-6 py-3 rounded-2xl bg-[#2B4C7E] hover:bg-[#1E3A63] text-white font-semibold shadow-md active:scale-95 transition-all"
+          className="flex items-center gap-2 px-5 sm:px-6 py-3 rounded-2xl bg-[#2B4C7E] hover:bg-[#1E3A63] text-white font-semibold shadow-md active:scale-95 transition-all cursor-pointer"
         >
           <Play size={18} className="fill-white ml-0.5" />
           <span>Start Drills</span>
@@ -181,10 +283,16 @@ export default function StudyDeckView() {
         <button
           type="button"
           onClick={goNext}
-          disabled={currentIndex === totalCards - 1}
-          className="flex items-center gap-1.5 px-4 py-3 rounded-2xl bg-white hover:bg-[#F5F3EF] disabled:opacity-40 text-stone-700 font-bold border border-[#E5E0D8] shadow-xs transition-colors"
+          disabled={currentIndex === totalCards - 1 && isRevealed}
+          className={`flex items-center gap-1.5 px-4 py-3 rounded-2xl font-bold border shadow-xs transition-all cursor-pointer ${
+            !isRevealed
+              ? 'bg-[#FDF2EF] hover:bg-[#FCE5E0] border-[#F5C6BC] text-[#D94E34] animate-pulse'
+              : 'bg-white hover:bg-[#F5F3EF] border-[#E5E0D8] text-stone-700 disabled:opacity-40'
+          }`}
+          title={!isRevealed ? "Tap to reveal before advancing" : "Next Card"}
         >
-          Next <ChevronRight size={18} />
+          <span>{isRevealed ? 'Next' : 'Reveal'}</span>
+          <ChevronRight size={18} />
         </button>
       </div>
     </div>

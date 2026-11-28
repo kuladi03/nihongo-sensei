@@ -135,31 +135,69 @@ export const GOJUON_ROWS = [
   },
 ];
 
+export const GOJUON_HIRAGANA_SET = new Set([
+  'あ','い','う','え','お',
+  'か','き','く','け','こ',
+  'さ','し','す','せ','そ',
+  'た','ち','つ','て','と',
+  'な','に','ぬ','ね','の',
+  'は','ひ','ふ','へ','ほ',
+  'ま','み','む','め','も',
+  'や','ゆ','よ',
+  'ら','り','る','れ','ろ',
+  'わ','を','ん'
+]);
+
+export const GOJUON_KATAKANA_SET = new Set([
+  'ア','イ','ウ','エ','オ',
+  'カ','キ','ク','ケ','コ',
+  'サ','シ','セ','ソ',
+  'タ','チ','ツ','テ','ト',
+  'ナ','ニ','ヌ','ネ','ノ',
+  'ハ','ヒ','フ','ヘ','ホ',
+  'マ','ミ','ム','メ','モ',
+  'ヤ','ユ','ヨ',
+  'ラ','リ','ル','レ','ロ',
+  'ワ','ヲ','ン'
+]);
+
 export default function KanaChartView() {
   const { bankItems = [], setActiveView } = useApp();
   const [scriptType, setScriptType] = useState('hiragana'); // 'hiragana' | 'katakana'
   const [slowAudio, setSlowAudio] = useState(false);
   const [playingChar, setPlayingChar] = useState(null);
 
-  // Dynamic Unlock Map: Filter by script range and match against item.kana_only || item.japanese
-  const learnedKanaMap = useMemo(() => {
+  // Dynamic Unlock Map: strictly deduplicate by character glyph, separate standard Gojūon (cap at 46) and extra dakuten/yōon
+  const { learnedKanaMap, gojuonLearnedCount, extraLearnedCount } = useMemo(() => {
     const map = {};
-    const scriptRegex = scriptType === 'hiragana' ? /[\u3040-\u309F]/ : /[\u30A0-\u30FF]/;
+    const scriptRegex = scriptType === 'hiragana' ? /^[\u3040-\u309F]+$/ : /^[\u30A0-\u30FF]+$/;
+    const targetGojuonSet = scriptType === 'hiragana' ? GOJUON_HIRAGANA_SET : GOJUON_KATAKANA_SET;
 
     (bankItems || []).forEach(item => {
       if ((item.item_type || '').toUpperCase() !== 'KANA') return;
       const text = (item.kana_only || item.japanese || '').trim();
+      if (!text || text.length > 2) return;
       if (scriptRegex.test(text)) {
-        map[text] = item;
+        if (!map[text] || (!map[text].audio_path && item.audio_path)) {
+          map[text] = item;
+        }
       }
     });
 
-    return map;
+    const learnedKeys = Object.keys(map);
+    const gojuonLearned = learnedKeys.filter(k => targetGojuonSet.has(k)).length;
+    const extraLearned = learnedKeys.filter(k => !targetGojuonSet.has(k)).length;
+
+    return {
+      learnedKanaMap: map,
+      gojuonLearnedCount: Math.min(46, gojuonLearned),
+      extraLearnedCount: extraLearned,
+    };
   }, [bankItems, scriptType]);
 
   const totalCharacters = 46;
-  const learnedCount = Object.keys(learnedKanaMap).length;
-  const progressPercent = Math.round((learnedCount / totalCharacters) * 100);
+  const progressPercent = Math.min(100, Math.round((gojuonLearnedCount / totalCharacters) * 100));
+  const remainingCount = Math.max(0, totalCharacters - gojuonLearnedCount);
 
   // Default selected Kana: 'あ' or 'か' if available
   const [selectedKana, setSelectedKana] = useState(() => {
@@ -291,20 +329,27 @@ export default function KanaChartView() {
               {scriptType === 'hiragana' ? 'Hiragana Progress' : 'Katakana Progress'}:
             </span>
             <span className="text-xs font-extrabold text-[#4A7C59]">
-              {learnedCount} / {totalCharacters} learned ({progressPercent}%)
+              {gojuonLearnedCount} / {totalCharacters} learned ({progressPercent}%)
             </span>
+            {extraLearnedCount > 0 && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#2B4C7E]/10 text-[#2B4C7E] border border-[#2B4C7E]/20">
+                +{extraLearnedCount} Dakuten / Yōon
+              </span>
+            )}
           </div>
           <div className="text-[11px] font-semibold text-stone-500">
-            {learnedCount === 0
+            {gojuonLearnedCount === 0
               ? 'Introduced in upcoming Katakana class notes'
-              : `${totalCharacters - learnedCount} remaining to achieve 100% syllabary mastery`}
+              : remainingCount === 0
+              ? '🎉 100% Gojūon syllabary mastered!'
+              : `${remainingCount} remaining to achieve 100% syllabary mastery`}
           </div>
         </div>
 
         {/* Bar */}
         <div className="w-full h-3 rounded-full bg-[#F5F3EF] border border-[#E5E0D8] overflow-hidden p-0.5">
           <div
-            className="h-full rounded-full bg-[#4A7C59] transition-all duration-500 shadow-xs"
+            className="h-full rounded-full bg-gradient-to-r from-[#4A7C59] to-[#2B4C7E] transition-all duration-500 shadow-xs"
             style={{ width: `${Math.max(progressPercent, 4)}%` }}
           />
         </div>

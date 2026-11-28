@@ -36,9 +36,9 @@ export default function TopBar() {
   } = useApp();
 
   const scriptModeLabels = {
-    assist: { label: "Assist", desc: "Stacked Kana + Romaji", color: "text-[#2B4C7E] bg-[#F5F3EF] border-[#E5E0D8]" },
-    kana: { label: "Kana", desc: "Kana only (Hover for Romaji)", color: "text-[#233E2B] bg-[#EDF5EF] border-[#C5DEC9]" },
-    native: { label: "Native", desc: "Pure Japanese only", color: "text-stone-800 bg-[#F5F3EF] border-[#E5E0D8]" },
+    assist: { label: "Assist", desc: "Assist Mode: Kanji + Furigana + Romaji", color: "text-[#2B4C7E] bg-[#F5F3EF] border-[#E5E0D8]" },
+    kana: { label: "Kana", desc: "Kana Mode: Kanji + Furigana (Hover/Tap to peek Romaji)", color: "text-[#233E2B] bg-[#EDF5EF] border-[#C5DEC9]" },
+    native: { label: "Native", desc: "Native Mode: Pure Japanese only (No Romaji)", color: "text-stone-900 bg-white border-stone-300 shadow-xs" },
   };
 
   const currentModeInfo = scriptModeLabels[scriptMode] || scriptModeLabels.assist;
@@ -98,7 +98,7 @@ export default function TopBar() {
               <span>Kana</span>
               {learnedKanaCount > 0 && (
                 <span className="px-1.5 py-0.2 rounded-full text-[10px] font-extrabold bg-[#4A7C59]/10 text-[#4A7C59] border border-[#4A7C59]/20">
-                  {learnedKanaCount}/46
+                  {Math.min(46, learnedKanaCount)}/46
                 </span>
               )}
             </button>

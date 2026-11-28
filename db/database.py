@@ -82,9 +82,45 @@ def clear_cache():
 _pool: Optional[ConnectionPool] = None
 _pool_lock = threading.RLock()
 
+def sanitize_database_url(url: str) -> str:
+    """Sanitizes DATABASE_URL by stripping any 'psql' CLI command prefix, quotes, and whitespace.
+    
+    Handles common user copy-paste formats from Neon dashboard:
+    - psql 'postgresql://user:pass@ep-xyz-pooler.neon.tech/neondb?sslmode=require'
+    - 'postgresql://user:pass@ep-xyz-pooler.neon.tech/neondb?sslmode=require'
+    - "postgresql://user:pass@ep-xyz-pooler.neon.tech/neondb?sslmode=require"
+    - psql postgresql://...
+    """
+    if not url:
+        return ""
+    u = url.strip()
+    # Strip wrapping quotes
+    if (u.startswith('"') and u.endswith('"')) or (u.startswith("'") and u.endswith("'")):
+        u = u[1:-1].strip()
+
+    # Search for standard postgres URI anywhere in the string
+    m = re.search(r"postgres(?:ql)?://[^\s'\"]+", u)
+    if m:
+        u = m.group(0)
+    elif u.startswith("psql"):
+        u = re.sub(r"^psql\s+(-d\s+|--dbname=\s*)?", "", u).strip()
+        u = u.strip("'\"").strip()
+
+    u = u.strip("'\"").strip()
+
+    # Neon connections require sslmode=require
+    if ("neon.tech" in u or "pooler" in u) and "sslmode=" not in u:
+        sep = "&" if "?" in u else "?"
+        u = f"{u}{sep}sslmode=require"
+
+    return u
+
 def get_database_url() -> str:
-    url = os.getenv("DATABASE_URL", "").strip()
+    raw = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("NEON_DATABASE_URL") or ""
+    url = sanitize_database_url(raw)
     if url:
+        if raw.strip() != url:
+            logger.info("Sanitized DATABASE_URL (cleaned CLI command prefix or quotes).")
         return url
     return "postgresql://localhost:5432/nihongo"
 

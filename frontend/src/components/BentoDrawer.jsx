@@ -147,7 +147,7 @@ export default function BentoDrawer({ unit, onClose }) {
                           {trap.marathi_meaning || trap.marathi || trap.english_meaning}
                         </span>
                       </div>
-                      <p className="text-[11px] text-stone-600 font-sans leading-relaxed">
+                      <p className="text-xs text-[#9A2E1A] font-marathi font-medium leading-relaxed">
                         {trap.trap_note || trap.pronunciation_tip || "Watch for unaspirated consonants and particle reading rules."}
                       </p>
                     </div>

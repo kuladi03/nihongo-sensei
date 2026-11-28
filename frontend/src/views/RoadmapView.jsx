@@ -376,7 +376,7 @@ export default function RoadmapView() {
             </div>
 
             <p className="text-xs text-stone-500 mb-3">
-              Unlocks every 5 units. Cumulative review testing cross-unit mastery and phone/time rules.
+              Unlocks every 5 units. Cumulative review testing cross-unit mastery and phonetic/time rules.
             </p>
 
             <div className="w-full h-2.5 bg-[#F5F3EF] rounded-full overflow-hidden border border-[#E5E0D8]">
@@ -397,7 +397,7 @@ export default function RoadmapView() {
                 <span className="text-xs font-bold text-stone-900">Kana Chart</span>
               </div>
               <span className="text-[11px] text-stone-500 block mt-0.5">
-                {learnedKanaCount || 10} / 46 Gojūon learned
+                {Math.min(46, learnedKanaCount || 0)} / 46 Gojūon learned
               </span>
             </div>
             <button
